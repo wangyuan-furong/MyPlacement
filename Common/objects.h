@@ -56,7 +56,7 @@ public:
     inline POS_2D getUR_2D() const { return ur(); }
 };
 
-// 布线行（BookShelf .scl 文件的 CoreRow）
+// 布局行（BookShelf .scl 文件的 CoreRow）
 class SiteRow
 {
 public:
