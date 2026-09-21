@@ -7,6 +7,11 @@ project(myplacement)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# 默认 Release：本项目 Eigen 稀疏求解 + 模板密集，-O0 比 -O3 慢一个数量级
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 # CImg 编译时禁用显示（本项目仅用文件 IO 画图；系统无 X11 头文件，不能链接 -lX11）
 add_definitions(-Dcimg_display=0)
 
