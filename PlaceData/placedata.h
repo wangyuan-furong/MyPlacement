@@ -11,6 +11,10 @@ public:
     int netCount;      // 网络数
     int pinCount;      // 引脚数
     int terminalCount; // 终端数
+    int maxNetDegree;  // 最大网络度数（来自 .nets）
+
+    // 网络度数分布，下标含义：0: 1 引脚 / 1: 2 引脚 / 2: 3-10 / 3: 11-100 / 4: >100
+    int netDegreeHist[5];
 
     float siteHeight;  // 标准单元行高（来自 .scl）
     float siteWidth;   // site 宽度（来自 .scl）
@@ -37,6 +41,9 @@ public:
         netCount = 0;
         pinCount = 0;
         terminalCount = 0;
+        maxNetDegree = 0;
+        for (int i = 0; i < 5; i++)
+            netDegreeHist[i] = 0;
         siteHeight = 0;
         siteWidth = 0;
     }

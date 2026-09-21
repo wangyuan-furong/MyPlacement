@@ -1,4 +1,5 @@
 #include "placedata.h"
+#include <iomanip>
 
 // 提取路径的目录部分
 static string dirOf(const string &path)
@@ -7,6 +8,15 @@ static string dirOf(const string &path)
     if (p == string::npos)
         return ".";
     return path.substr(0, p);
+}
+
+// 提取路径的文件名部分（日志中只打印文件名，与参考输出一致）
+static string baseName(const string &path)
+{
+    size_t p = path.find_last_of("/\\");
+    if (p == string::npos)
+        return path;
+    return path.substr(p + 1);
 }
 
 // 判断是否为头部行（UCLA 头 / 注释 / 空行）
@@ -32,15 +42,17 @@ Module *PlaceData::getModuleByName(const string &name)
 // 入口：解析 BookShelf 全套文件
 bool PlaceData::ReadBookShelf(const string &auxPath)
 {
+    cout << "Use BOOKSHELF placement format" << endl;
     if (!ReadAuxFile(auxPath))
         return false;
     if (!ReadSclFile(sclFile))
         return false;
     if (!ReadNodesFile(nodesFile))
         return false;
-    if (!ReadPlFile(plFile))
-        return false;
+    // pl 与 nets 互不依赖，此处按 nets 在前的顺序读，使日志顺序与参考输出一致
     if (!ReadNetsFile(netsFile))
+        return false;
+    if (!ReadPlFile(plFile))
         return false;
     ReadWtsFile(wtsFile); // wts 可选，允许失败
     PlaceTerminalsOnBoundary();
@@ -77,8 +89,7 @@ bool PlaceData::ReadAuxFile(const string &auxPath)
     if (!plFile.empty()) plFile = basePath + "/" + plFile;
     if (!sclFile.empty()) sclFile = basePath + "/" + sclFile;
 
-    cout << "Reading AUX file: " << auxPath << endl;
-    cout << "  " << nodesFile << " " << netsFile << " " << wtsFile << " " << plFile << " " << sclFile << endl;
+    cout << "ReadAUXFile: " << auxPath << endl;
     return true;
 }
 
@@ -90,6 +101,7 @@ bool PlaceData::ReadSclFile(const string &path)
         cerr << "[错误] 无法打开 scl 文件: " << path << endl;
         return false;
     }
+    cout << "ReadSCLFile: " << baseName(path) << endl;
     string line;
     int numRows = 0;
     bool firstRow = true;
@@ -156,7 +168,8 @@ bool PlaceData::ReadSclFile(const string &path)
     }
     coreRegion.ll = POS_2D(minX, minY);
     coreRegion.ur = POS_2D(maxX, maxY);
-    cout << "Set core region from site info: ll " << coreRegion.ll << "  ur " << coreRegion.ur << endl;
+    cout << "CoreRegion: lower left: " << coreRegion.ll << " to upper right: " << coreRegion.ur << endl;
+    cout << "NumRows: " << SiteRows.size() << endl;
     return true;
 }
 
@@ -168,6 +181,7 @@ bool PlaceData::ReadNodesFile(const string &path)
         cerr << "[错误] 无法打开 nodes 文件: " << path << endl;
         return false;
     }
+    cout << "ReadNodesFile: " << baseName(path) << endl;
     string line;
     int numNodes = 0;
     while (getline(in, line))
@@ -222,8 +236,8 @@ bool PlaceData::ReadNodesFile(const string &path)
     Nodes.reserve(Nodes.size());
     Terminals.reserve(Terminals.size());
     cout << "NumModules: " << moduleCount << endl;
-    cout << "  NumNodes(可移动): " << Nodes.size() << "  Terminals: " << Terminals.size()
-         << "  Macro: " << MacroCount << endl;
+    cout << "NumNodes: " << Nodes.size() << endl;
+    cout << "Terminals: " << Terminals.size() << endl;
     return true;
 }
 
@@ -235,6 +249,7 @@ bool PlaceData::ReadPlFile(const string &path)
         cerr << "[错误] 无法打开 pl 文件: " << path << endl;
         return false;
     }
+    cout << "ReadPLFile: " << baseName(path) << endl;
     string line;
     while (getline(in, line))
     {
@@ -251,7 +266,6 @@ bool PlaceData::ReadPlFile(const string &path)
             m->orientation = parseOrientation(orient);
         }
     }
-    cout << "Initialize module position with file: " << path << endl;
     return true;
 }
 
@@ -263,6 +277,7 @@ bool PlaceData::ReadNetsFile(const string &path)
         cerr << "[错误] 无法打开 nets 文件: " << path << endl;
         return false;
     }
+    cout << "ReadNetsFile: " << baseName(path) << endl;
     string line;
     int numNets = 0, numPins = 0;
     while (getline(in, line))
@@ -291,6 +306,15 @@ bool PlaceData::ReadNetsFile(const string &path)
             string key, colon, netname;
             int degree;
             iss >> key >> colon >> degree >> netname;
+
+            // 统计网络度数分布
+            if (degree > maxNetDegree)
+                maxNetDegree = degree;
+            if (degree == 1) netDegreeHist[0]++;
+            else if (degree == 2) netDegreeHist[1]++;
+            else if (degree <= 10) netDegreeHist[2]++;
+            else if (degree <= 100) netDegreeHist[3]++;
+            else netDegreeHist[4]++;
 
             Net *net = new Net();
             net->idx = (int)Nets.size();
@@ -321,7 +345,10 @@ bool PlaceData::ReadNetsFile(const string &path)
     }
     netCount = (int)Nets.size();
     pinCount = (int)Pins.size();
-    cout << "Nets: " << netCount << "  Pins: " << pinCount << endl;
+    cout << "Nets: " << netCount << endl;
+    cout << "Pins: " << pinCount << endl;
+    cout << "Max net degree= " << maxNetDegree << endl;
+    cout << "total pin number= " << pinCount << endl;
     return true;
 }
 
@@ -426,28 +453,46 @@ void PlaceData::InitChipRegion()
 
 void PlaceData::PrintSummary()
 {
-    double movableArea = 0, fixedArea = 0;
+    double movableArea = 0, fixedArea = 0, fixedAreaInCore = 0;
     for (size_t i = 0; i < Nodes.size(); i++)
         movableArea += (double)Nodes[i]->width * Nodes[i]->height;
     for (size_t i = 0; i < Terminals.size(); i++)
-        fixedArea += (double)Terminals[i]->width * Terminals[i]->height;
+    {
+        Module *t = Terminals[i];
+        double area = (double)t->width * t->height;
+        fixedArea += area;
+        // 只有整个矩形都落在 core 内的终端才计入 fixedAreaInCore
+        POS_2D ur = t->ur();
+        if (t->ll.x >= coreRegion.ll.x && t->ll.y >= coreRegion.ll.y &&
+            ur.x <= coreRegion.ur.x && ur.y <= coreRegion.ur.y)
+            fixedAreaInCore += area;
+    }
     double coreArea = coreRegion.area();
 
-    int maxDegree = 0;
-    for (size_t i = 0; i < Nets.size(); i++)
-        maxDegree = max(maxDegree, (int)Nets[i]->netPins.size());
+    // 保存流状态，避免 fixed/precision 泄漏到后续输出
+    ios_base::fmtflags oldFlags = cout.flags();
+    streamsize oldPrecision = cout.precision();
+    cout << fixed;
 
     cout << endl
-         << "<<<< DATABASE SUMMARY >>>>" << endl;
-    cout << "  Core region: ll " << coreRegion.ll << "  ur " << coreRegion.ur << endl;
-    cout << "  Row Height/Number: " << siteHeight << " / " << SiteRows.size() << endl;
-    cout << "  Core Area: " << coreArea << endl;
-    cout << "  Cell Area: " << movableArea << " (" << movableArea / coreArea * 100 << "%)" << endl;
-    cout << "  Movable Area: " << movableArea << endl;
-    cout << "  Fixed Area: " << fixedArea << " (" << fixedArea / coreArea * 100 << "%)" << endl;
-    cout << "  Cell #: " << Nodes.size() << endl;
-    cout << "  Object #: " << moduleCount << " (fixed: " << Terminals.size() << ") (macro: " << MacroCount << ")" << endl;
-    cout << "  Net #: " << netCount << endl;
-    cout << "  Max net degree: " << maxDegree << endl;
-    cout << "  Pin #: " << pinCount << endl;
+         << "--------------SUMMARIES--------------" << endl;
+    cout << "Area:" << endl;
+    cout << "Core Area: " << setprecision(0) << coreArea << endl;
+    cout << "Cell Area: " << setprecision(0) << movableArea
+         << " (cellArea / coreArea = " << setprecision(2) << movableArea / coreArea * 100 << "%)" << endl;
+    cout << "Movable Area: " << setprecision(0) << movableArea
+         << " (movableArea / coreArea = " << setprecision(2) << movableArea / coreArea * 100 << "%)" << endl;
+    cout << "Fixed Area: " << setprecision(0) << fixedArea
+         << " (fixedArea / coreArea = " << setprecision(2) << fixedArea / coreArea * 100 << "%)" << endl;
+    cout << "Fixed Area in Core: " << setprecision(0) << fixedAreaInCore
+         << " (fixedAreaInCore / coreArea = " << setprecision(2) << fixedAreaInCore / coreArea * 100 << "%)" << endl;
+
+    cout << "There are " << netDegreeHist[0] << " nets (has 1 pins)" << endl;
+    cout << "There are " << netDegreeHist[1] << " nets (has 2 pins)" << endl;
+    cout << "There are " << netDegreeHist[2] << " nets (has 3-10 pins)" << endl;
+    cout << "There are " << netDegreeHist[3] << " nets (has 11-100 pins)" << endl;
+    cout << "There are " << netDegreeHist[4] << " nets (has >100 pins)" << endl;
+
+    cout.flags(oldFlags);
+    cout.precision(oldPrecision);
 }
