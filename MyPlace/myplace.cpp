@@ -361,9 +361,12 @@ void MyPlacer::QuadraticInitialPlacement()
         }
 
         // 构建稀疏矩阵（结构固定，值随迭代变化）
+        // CG 的模板参数 UpLo 取默认值 Lower，即自伴视图只读矩阵的**下三角**；
+        // 因此每条边只写 (hi,lo) 这一个位置即可，上三角写了也不会被读取。
+        // 这样非零元从 n+2E 降到 n+E，存储和组装开销都减半。
         vector<Eigen::Triplet<float>> tx, ty;
-        tx.reserve((size_t)n + E * 2);  //n个对角，E条边，每条边有两个非对角元素
-        ty.reserve((size_t)n + E * 2);
+        tx.reserve((size_t)n + E);  //n个对角 + E条边（只写下三角）
+        ty.reserve((size_t)n + E);
         for (int i = 0; i < n; i++)
         {
             tx.push_back(Eigen::Triplet<float>(i, i, (float)diagX[i]));
@@ -371,11 +374,9 @@ void MyPlacer::QuadraticInitialPlacement()
         }
         for (int e = 0; e < E; e++)
         {
-            int i = edges[e].first, j = edges[e].second;
-            tx.push_back(Eigen::Triplet<float>(i, j, (float)offX[e]));
-            tx.push_back(Eigen::Triplet<float>(j, i, (float)offX[e]));
-            ty.push_back(Eigen::Triplet<float>(i, j, (float)offY[e]));
-            ty.push_back(Eigen::Triplet<float>(j, i, (float)offY[e]));
+            int lo = edges[e].first, hi = edges[e].second; // lo < hi
+            tx.push_back(Eigen::Triplet<float>(hi, lo, (float)offX[e]));
+            ty.push_back(Eigen::Triplet<float>(hi, lo, (float)offY[e]));
         }
 
         Eigen::SparseMatrix<float, Eigen::RowMajor> Ax(n, n), Ay(n, n);
