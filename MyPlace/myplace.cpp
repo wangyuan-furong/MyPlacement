@@ -427,20 +427,30 @@ static const float DCT_PI = 3.14159265358979323846f;
 struct DCTSolver
 {
     int m;
-    vector<float> cosT, sinT;            // cosT[j*m+x]=cos(jπx/m)，sinT 同理
+    vector<float> cosT, sinT;            // cosT[j*m+x]=cos(πj(x+0.5)/m)，sinT 同理
+    vector<float> cn;                    // 正交归一化系数：cn_j=√(1/m)(j=0) 或 √(2/m)(j≥1)
     vector<float> tmpA, a, G, Sx, Sy;    // 复用缓冲区
 
+    // 基函数取正交的 DCT-II：φ_j(x)=cn_j·cos(πj(x+0.5)/m)，采样点在 bin 中心。
+    // 若采样点写成 x（网格顶点）则基在网格上不正交——Σ_{x=0}^{m-1} cos(πjx/m)
+    // 对奇数 j 等于 1 而非 0，于是直流分量（ρ̄=targetDensity=0.8）会泄漏进全部
+    // 奇次模态，导致"均匀密度解出非零电场"（实测 max|ξ|≈0.35），等价于给所有
+    // 单元叠加一个恒定的 +x/+y 推力，把布局整体往右上挤。
     DCTSolver(int _m) : m(_m)
     {
         cosT.resize(m * m);
         sinT.resize(m * m);
+        cn.resize(m);
         for (int j = 0; j < m; j++)
+        {
+            cn[j] = (j == 0) ? sqrtf(1.0f / m) : sqrtf(2.0f / m);
             for (int x = 0; x < m; x++)
             {
-                float ang = DCT_PI * (float)j * x / m;
+                float ang = DCT_PI * (float)j * (x + 0.5f) / m;
                 cosT[j * m + x] = cosf(ang);
                 sinT[j * m + x] = sinf(ang);
             }
+        }
         tmpA.resize(m * m);
         a.resize(m * m);
         G.resize(m * m);
@@ -451,8 +461,7 @@ struct DCTSolver
     // 输入 rho[m*m]（行优先 y*m+x），输出电场 ex、ey[m*m]
     void solve(const vector<float> &rho, vector<float> &ex, vector<float> &ey)
     {
-        int m2 = m * m;
-        // 1) 列方向 DCT：tmpA[k][x] = Σ_y rho(x,y) cos(kπy/m)
+        // 1) 列方向 DCT：tmpA[k][x] = cn_k Σ_y rho(x,y) cos(πk(y+0.5)/m)
         for (int x = 0; x < m; x++)
             for (int k = 0; k < m; k++)
             {
@@ -460,10 +469,11 @@ struct DCTSolver
                 const float *cosk = &cosT[k * m];
                 for (int y = 0; y < m; y++)
                     s += rho[y * m + x] * cosk[y];
-                tmpA[k * m + x] = s;
+                tmpA[k * m + x] = s * cn[k];
             }
-        // 2) 行方向 DCT：a[j][k] = (1/m²) Σ_x tmpA[k][x] cos(jπx/m)
-        float inv = 1.0f / (float)m2;
+        // 2) 行方向 DCT：a[j][k] = cn_j Σ_x tmpA[k][x] cos(πj(x+0.5)/m)
+        //    正交基下 a[j][k] 就是 ρ 在 φ_jφ_k 上的展开系数（cn_j·cn_k 即原先的 1/m²，
+        //    只是 j=0 或 k=0 时 norm² 为 m 而非 m/2，少了这个差别就会逐模态标错系数）
         for (int k = 0; k < m; k++)
             for (int j = 0; j < m; j++)
             {
@@ -471,9 +481,9 @@ struct DCTSolver
                 const float *cosj = &cosT[j * m];
                 for (int x = 0; x < m; x++)
                     s += tmpA[k * m + x] * cosj[x];
-                a[j * m + k] = s * inv;
+                a[j * m + k] = s * cn[j];
             }
-        // 3) ξ_x：G[j][k]=a·w_j/(w_j²+w_k²)；Sx[j][y]=Σ_k G cos；ex=Σ_j Sx sin
+        // 3) ξ_x：G[j][k]=a·w_j/(w_j²+w_k²)；Sx[j][y]=cn_k Σ_k G cos；ex=cn_j Σ_j Sx sin
         for (int j = 0; j < m; j++)
         {
             float wj = DCT_PI * (float)j / m;
@@ -489,7 +499,7 @@ struct DCTSolver
             {
                 float s = 0;
                 for (int k = 0; k < m; k++)
-                    s += G[j * m + k] * cosT[k * m + y];
+                    s += G[j * m + k] * cn[k] * cosT[k * m + y];
                 Sx[j * m + y] = s;
             }
         for (int y = 0; y < m; y++)
@@ -497,10 +507,10 @@ struct DCTSolver
             {
                 float s = 0;
                 for (int j = 0; j < m; j++)
-                    s += Sx[j * m + y] * sinT[j * m + x];
+                    s += cn[j] * Sx[j * m + y] * sinT[j * m + x];
                 ex[y * m + x] = s;
             }
-        // 4) ξ_y：G[j][k]=a·w_k/(w_j²+w_k²)；Sy[k][x]=Σ_j G cos(jπx/m)；ey=Σ_k Sy sin(kπy/m)
+        // 4) ξ_y：G[j][k]=a·w_k/(w_j²+w_k²)；Sy[k][x]=cn_j Σ_j G cos；ey=cn_k Σ_k Sy sin
         for (int j = 0; j < m; j++)
         {
             float wj = DCT_PI * (float)j / m;
@@ -516,7 +526,7 @@ struct DCTSolver
             {
                 float s = 0;
                 for (int j = 0; j < m; j++)
-                    s += G[j * m + k] * cosT[j * m + x];
+                    s += G[j * m + k] * cn[j] * cosT[j * m + x];
                 Sy[k * m + x] = s;
             }
         for (int y = 0; y < m; y++)
@@ -524,7 +534,7 @@ struct DCTSolver
             {
                 float s = 0;
                 for (int k = 0; k < m; k++)
-                    s += Sy[k * m + x] * sinT[k * m + y];
+                    s += cn[k] * Sy[k * m + x] * sinT[k * m + y];
                 ey[y * m + x] = s;
             }
     }
@@ -1040,9 +1050,12 @@ void MyPlacer::GlobalPlacement()
         if (!lambdaFrozen)
         {
             // 密度已基本解开（τ<0.25）且线长开始恶化 → 冻结 λ（即 DREAMPlace
-            // Llambda 停止准则“overflow<stop && hpwl>prev”，此处把 0.1 放宽到 0.25，
-            // 因本实现 τ 底部约 0.105、0.1 几乎达不到）。否则 μ 在 HPWL 微幅波动时
-            // 仍保持 1.03~1.05，λ 复利无界增长，把已收敛布局继续挤开、白损 HPWL。
+            // Llambda 停止准则“overflow<stop && hpwl>prev”，此处把 0.1 放宽到 0.25）。
+            // 这个冻结是**承重**的：μ 在 HPWL 改善时恒 ≥1.029，不冻结则 λ 会复利
+            // 无界增长。实测把阈值放开到 0.11，λ 从 3.1e-2 一路涨到 2.54，τ 虽降到
+            // 0.106，但密度变成"边缘满、中心空"的环状（单元被推到芯片外墙上），
+            // 合法化位移从 1.6e7 涨到 1.5e8、HPWL 从 106.7M 劣化到 263.7M。
+            // 即 τ 的平台是 WL/密度权衡的平衡点，不是收敛缺陷，更不是可以硬压的指标。
             if (tau < 0.25f && delta > 0)
             {
                 lambdaFrozen = true;
