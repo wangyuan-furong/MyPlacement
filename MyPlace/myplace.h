@@ -77,7 +77,7 @@ public:
     // 任务5：全局布局（ePlace 电静力学 + Nesterov）
     void GlobalPlacement();
 
-    // 任务7：合法化（Abacus 标准单元行合法化）
+    // 任务7：合法化（候选行 + 行内二次优化的标准单元合法化）
     void AbacusLegalization();
 
     // ---- 任务5 内部状态 ----

@@ -1141,10 +1141,160 @@ void MyPlacer::GlobalPlacement()
     printf("  全局布局完成，HPWL = %.0f\n", calcHPWL());
 }
 
-// ---- 任务7：Abacus 标准单元合法化 ----
-// 核心思想（参考 ISPD'08 Abacus）：按 x 坐标从左到右处理标准单元，
-// 每个单元放到离它当前 y 最近的行；行内贪心放置以最小化水平位移；
-// 行放满则顺延到下一行（溢出处理）。宏单元保持全局布局的位置不动。
+// ---- 任务7：候选行 + 行内二次优化标准单元合法化 ----
+// 思路：每个单元只在 y 方向最近的 K 个行中试插；行内单元按目标 x 排序后，
+// 一次性求解
+//     min Σ (x_i - x_i^0)^2  s.t. 不重叠、不越出所在行、对齐 site
+// 这是一个链式可分凸二次规划，换元后化为「有界保序回归」，
+// 用 PAVA（pool adjacent violators）在 O(n) 内得到整行最优合法位置。
+// 宏单元保持全局布局的位置不动（本 benchmark 无宏单元）。
+
+namespace
+{
+// 合法化中的单元及其全局布局目标位置（左下角）
+struct LegalCell
+{
+    Module *m;
+    double tx;
+    double ty;
+};
+
+// PAVA 的块：a[l..r] 被合并成一个均值 val 的块
+struct QPBlock
+{
+    int l, r;
+    double sum;
+    int cnt;
+    double val;
+};
+
+// 有界保序回归：min Σ (y_i - a_i)^2，约束 lo ≤ y_1 ≤ ... ≤ y_n ≤ hi
+static bool BoundedIsotonicRegression(const vector<double> &a, double lo, double hi, vector<double> &y)
+{
+    int n = (int)a.size();
+    y.assign(n, 0.0);
+    if (n == 0)
+        return true;
+    if (hi < lo - 1e-12)
+        return false;
+    if (hi < lo)
+        hi = lo;
+
+    vector<QPBlock> stack;
+    stack.reserve(n);
+    for (int i = 0; i < n; ++i)
+    {
+        QPBlock b{i, i, a[i], 1, a[i]};
+        // 前一块均值大于当前块均值时违反单调性 → 合并
+        while (!stack.empty() && stack.back().val > b.val + 1e-12)
+        {
+            QPBlock p = stack.back();
+            stack.pop_back();
+            b.l = p.l;
+            b.sum += p.sum;
+            b.cnt += p.cnt;
+            b.val = b.sum / b.cnt;
+        }
+        stack.push_back(b);
+    }
+    // 块值截断到边界；单调性在截断后仍然保持
+    for (const QPBlock &b : stack)
+    {
+        double v = max(lo, min(hi, b.val));
+        for (int i = b.l; i <= b.r; ++i)
+            y[i] = v;
+    }
+    return true;
+}
+
+// 求解一行内的链式二次规划。
+// tx/width/xs 均按目标 x 升序排列；L/R 为行的左右边界。
+static bool SolveChainQP(const vector<double> &tx, const vector<double> &width,
+                         double L, double R, double siteW, vector<double> &xs)
+{
+    int n = (int)tx.size();
+    xs.assign(n, 0.0);
+    if (n == 0)
+        return true;
+    if (siteW <= 1e-12)
+        siteW = 1.0;
+
+    // 宽度换算到 site 单位；P_i 为前缀宽度
+    vector<double> pref(n + 1, 0.0), a(n);
+    bool integerSites = true;
+    for (int i = 0; i < n; ++i)
+    {
+        double w = width[i] / siteW;
+        if (fabs(w - nearbyint(w)) > 1e-6)
+            integerSites = false;
+        pref[i + 1] = pref[i] + w;
+    }
+
+    double total = pref[n];
+    double U = (R - L) / siteW - total; // 行剩余容量（site 数）
+    if (U < -1e-6)
+        return false; // 该行装不下
+
+    // x_i = L + siteW * (y_i + P_i)，约束化为 y 的有界单调
+    for (int i = 0; i < n; ++i)
+        a[i] = (tx[i] - L) / siteW - pref[i];
+
+    double hi = max(0.0, U);
+    if (integerSites)
+        hi = floor(U + 1e-6); // 容忍浮点误差导致的 -1e-7 量级负余量
+    if (hi < 0)
+        return false;
+
+    vector<double> y;
+    if (!BoundedIsotonicRegression(a, 0.0, hi, y))
+        return false;
+
+    if (integerSites)
+    {
+        // site 宽度与单元宽度都是整数倍：四舍五入后仍严格不重叠
+        for (int i = 0; i < n; ++i)
+        {
+            long long z = llround(y[i]) + llround(pref[i]);
+            xs[i] = L + (double)z * siteW;
+        }
+    }
+    else
+    {
+        // 一般情况：连续解贴到 site 格点，并保证不重叠
+        double prevRight = -1e30;
+        for (int i = 0; i < n; ++i)
+        {
+            double x = L + ceil(y[i] + pref[i] - 1e-9) * siteW;
+            if (x < prevRight)
+                x = prevRight;
+            xs[i] = x;
+            prevRight = x + width[i];
+        }
+    }
+    return true;
+}
+
+// 对一行（cells 已按目标 x 升序）求最优合法 x；失败表示容量溢出
+static bool SolveRowQP(const vector<LegalCell> &cells, const SiteRow &row,
+                       double siteW, vector<double> &xs)
+{
+    int n = (int)cells.size();
+    xs.assign(n, 0.0);
+    if (n == 0)
+        return true;
+
+    vector<double> tx(n), width(n);
+    for (int i = 0; i < n; ++i)
+    {
+        tx[i] = cells[i].tx;
+        width[i] = cells[i].m->width;
+    }
+    // 注：Siteorient 只影响单元朝向，不改变占据的物理 x 区间，
+    // 因此行方向对位置合法化不产生额外约束（本 benchmark 全部为 N）。
+    return SolveChainQP(tx, width, row.start.x, row.end.x, siteW, xs);
+}
+} // namespace
+
 void MyPlacer::AbacusLegalization()
 {
     vector<SiteRow> &rows = db->SiteRows;
@@ -1156,92 +1306,186 @@ void MyPlacer::AbacusLegalization()
 
     double hpwlBefore = calcHPWL();
 
-    // 行按 y（bottom）从小到大排序，保证“下一行”语义正确
+    // 行按 bottom 升序，便于二分查找 y 方向最近的候选行
     sort(rows.begin(), rows.end(), [](const SiteRow &a, const SiteRow &b)
-         { return a.bottom < b.bottom; });
+         {
+             if (a.bottom != b.bottom)
+                 return a.bottom < b.bottom;
+             return a.start.x < b.start.x;
+         });
 
-    // 收集标准单元（非宏），按当前 x 排序
-    vector<Module *> cells;
+    double siteW = db->siteWidth;
+    if (siteW <= 1e-9)
+        siteW = rows[0].step;
+    if (siteW <= 1e-9)
+        siteW = 1.0;
+
+    // 收集标准单元（非宏），保留全局布局的目标位置
+    vector<LegalCell> cells;
     cells.reserve(db->Nodes.size());
     for (Module *m : db->Nodes)
         if (!m->isMacro)
-            cells.push_back(m);
-    sort(cells.begin(), cells.end(), [](const Module *a, const Module *b)
-         { return a->ll.x < b->ll.x; });
+            cells.push_back({m, m->ll.x, m->ll.y});
 
-    // 每行已放置到的最右 x（初始为行左边界）
-    vector<double> rowX(rows.size());
-    for (size_t r = 0; r < rows.size(); r++)
-        rowX[r] = rows[r].start.x;
+    // 按目标 x 排序后，每个行内的插入顺序天然保持升序
+    sort(cells.begin(), cells.end(), [](const LegalCell &a, const LegalCell &b)
+         {
+             if (a.tx != b.tx)
+                 return a.tx < b.tx;
+             return a.m->idx < b.m->idx;
+         });
 
-    double totalMove = 0;
-    int placed = 0;
+    const int rowCount = (int)rows.size();
+    const int K = 4; // 每个单元最多试插的候选行数
 
-    for (Module *c : cells)
+    vector<vector<LegalCell>> rowCells(rowCount);
+    vector<double> rowLen(rowCount), rowUsed(rowCount, 0.0), rowCost(rowCount, 0.0);
+    for (int r = 0; r < rowCount; ++r)
+        rowLen[r] = rows[r].end.x - rows[r].start.x;
+
+    // 第一个 bottom >= y 的行下标
+    auto lowerBoundRow = [&](double y)
     {
-        double cy = c->center().y;
-
-        // 找 y 最近的行
-        int best = 0;
-        double bestDist = 1e30;
-        for (size_t r = 0; r < rows.size(); r++)
+        int lo = 0, hi = rowCount;
+        while (lo < hi)
         {
-            double ry = rows[r].bottom + rows[r].height * 0.5;
-            double d = fabs(cy - ry);
-            if (d < bestDist)
-            {
-                bestDist = d;
-                best = (int)r;
-            }
+            int mid = (lo + hi) >> 1;
+            if (rows[mid].bottom < y)
+                lo = mid + 1;
+            else
+                hi = mid;
         }
+        return lo;
+    };
 
-        // 从 best 行开始，向下找第一个能放下的行
-        int placedRow = -1;
-        for (int r = best; r < (int)rows.size(); r++)
+    vector<double> xs;
+    int fallbackCount = 0;
+
+    // ---- 行分配：按目标 x 从左到右处理，每个单元试插最近的 K 个可行行 ----
+    for (const LegalCell &c : cells)
+    {
+        int pos = lowerBoundRow(c.ty);
+        int left = pos - 1, right = pos;
+        int tested = 0, bestRow = -1;
+        double bestCost = 1e300;
+
+        while ((left >= 0 || right < rowCount) && tested < K)
         {
-            double xPos = max(rowX[r], (double)c->ll.x);
-            if (xPos + c->width <= rows[r].end.x + 1e-6)
+            int r;
+            if (right >= rowCount)
+                r = left--;
+            else if (left < 0)
+                r = right++;
+            else
             {
-                placedRow = r;
-                break;
+                double dl = c.ty - rows[left].bottom;
+                double dr = rows[right].bottom - c.ty;
+                if (dl <= dr)
+                    r = left--;
+                else
+                    r = right++;
             }
-        }
-        // 向下放不下则向上扫
-        if (placedRow < 0)
-        {
-            for (int r = best - 1; r >= 0; r--)
-            {
-                double xPos = max(rowX[r], (double)c->ll.x);
-                if (xPos + c->width <= rows[r].end.x + 1e-6)
+
+            // 容量预判：满了直接跳过，不做 QP
+            if (rowUsed[r] + c.m->width > rowLen[r] + 1e-6)
+                continue;
+
+            // 试插后重解该行，用「行内平方位移增量 + 垂直位移」作为代价
+            rowCells[r].push_back(c);
+            bool ok = SolveRowQP(rowCells[r], rows[r], siteW, xs);
+            double newCost = 0;
+            if (ok)
+                for (size_t i = 0; i < rowCells[r].size(); ++i)
                 {
-                    placedRow = r;
-                    break;
+                    double d = xs[i] - rowCells[r][i].tx;
+                    newCost += d * d;
                 }
+            rowCells[r].pop_back();
+            if (!ok)
+                continue;
+
+            double dy = rows[r].bottom - c.ty;
+            double cost = (newCost - rowCost[r]) + dy * dy;
+            if (cost < bestCost - 1e-9)
+            {
+                bestCost = cost;
+                bestRow = r;
             }
+            ++tested;
         }
-        if (placedRow < 0)
-            placedRow = best; // 极端情况：仍放不下，硬放到 best 行（容忍少量溢出）
 
-        // 水平位置：尽量保持原位，否则贴到行当前最右
-        double xPos = max(rowX[placedRow], (double)c->ll.x);
-        double maxX = rows[placedRow].end.x - c->width;
-        if (xPos > maxX)
-            xPos = maxX;
-        if (xPos < rows[placedRow].start.x)
-            xPos = rows[placedRow].start.x;
+        if (bestRow < 0)
+        {
+            // 理论上只在总容量不足时发生：放到最近行并计入溢出
+            bestRow = (pos < rowCount) ? pos : rowCount - 1;
+            fallbackCount++;
+        }
 
-        // 垂直位置：行底对齐
-        double yPos = rows[placedRow].bottom;
-
-        totalMove += fabs(xPos - c->ll.x) + fabs(yPos - c->ll.y);
-        c->ll = POS_2D((float)xPos, (float)yPos);
-        rowX[placedRow] = xPos + c->width;
-        placed++;
+        // 提交到选中的行，并更新该行的目标函数值
+        int r = bestRow;
+        rowCells[r].push_back(c);
+        rowUsed[r] += c.m->width;
+        if (SolveRowQP(rowCells[r], rows[r], siteW, xs))
+        {
+            double cost = 0;
+            for (size_t i = 0; i < rowCells[r].size(); ++i)
+            {
+                double d = xs[i] - rowCells[r][i].tx;
+                cost += d * d;
+            }
+            rowCost[r] = cost;
+        }
     }
 
-    printf("===== 合法化 (Abacus) =====\n");
-    printf("  标准单元 %d 个已放入 %zu 行，总位移 = %.0f\n", placed, rows.size(), totalMove);
-    printf("  合法化后 HPWL = %.0f（合法化前 %.0f）\n", calcHPWL(), hpwlBefore);
+    // ---- 逐行求解并写回位置 ----
+    double totalMove = 0;
+    int placed = 0, usedRows = 0;
+    int overlapPairs = 0, outOfRow = 0, offSite = 0;
+
+    for (int r = 0; r < rowCount; ++r)
+    {
+        if (rowCells[r].empty())
+            continue;
+        usedRows++;
+
+        vector<double> xs;
+        bool ok = SolveRowQP(rowCells[r], rows[r], siteW, xs);
+        if (!ok)
+        {
+            // 溢出回退：从左紧密排列（牺牲合法性，但保证有行坐标可继续观察）
+            double cur = rows[r].start.x;
+            for (size_t i = 0; i < rowCells[r].size(); ++i)
+            {
+                xs[i] = max(cur, rowCells[r][i].tx);
+                cur = xs[i] + rowCells[r][i].m->width;
+            }
+        }
+
+        for (size_t i = 0; i < rowCells[r].size(); ++i)
+        {
+            Module *m = rowCells[r][i].m;
+            double x = xs[i], y = rows[r].bottom;
+            totalMove += fabs(x - rowCells[r][i].tx) + fabs(y - rowCells[r][i].ty);
+            m->ll = POS_2D((float)x, (float)y);
+            placed++;
+
+            double z = (x - rows[r].start.x) / siteW;
+            if (fabs(z - llround(z)) > 1e-4)
+                offSite++;
+            if (x < rows[r].start.x - 1e-4 || x + m->width > rows[r].end.x + 1e-4)
+                outOfRow++;
+            if (i > 0 && xs[i - 1] + rowCells[r][i - 1].m->width > x + 1e-4)
+                overlapPairs++;
+        }
+    }
+
+    double hpwlAfter = calcHPWL();
+    printf("===== 合法化 (候选行 + 行内二次优化) =====\n");
+    printf("  标准单元 %d 个，使用 %d 行，候选行 K=%d\n", placed, usedRows, K);
+    printf("  总位移(L1) = %.0f\n", totalMove);
+    printf("  合法化后 HPWL = %.0f（合法化前 %.0f）\n", hpwlAfter, hpwlBefore);
+    printf("  合法性检查：重叠 %d 对，行外/越界 %d 个，未对齐 site %d 个，容量溢出回退 %d 个\n",
+           overlapPairs, outOfRow, offSite, fallbackCount);
 }
 
 
