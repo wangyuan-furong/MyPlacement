@@ -19,6 +19,7 @@ build/
 *.exe
 /myplace
 /task4_initial_placement_test
+/task5_global_placement_test
 
 # 程序生成的布局图片、GDS 文件和运行日志
 /output/

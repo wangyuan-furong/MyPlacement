@@ -69,7 +69,11 @@ int main(int argc, char *argv[])
     cout << endl
          << "===== 全局布局 (ePlace) =====" << endl;
     t0 = steady_clock::now();
-    placer->GlobalPlacement();
+    if (!placer->GlobalPlacement())
+    {
+        cerr << "全局布局数值求解失败，请查看停止原因" << endl;
+        return 1;
+    }
     double hpwl4 = placer->calcHPWL();
     double t4 = elapsedMs(t0);
     cout << "  全局布局      HPWL = " << fixed << setprecision(0) << hpwl4 << "   耗时 " << t4 << " ms" << endl;

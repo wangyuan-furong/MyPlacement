@@ -1,10 +1,12 @@
 #include "myplace.h"
+#include "electrostatics.h"
 #include <Eigen/Sparse>
 #include <Eigen/IterativeLinearSolvers>
 #include <unordered_map>
 #include <queue>
 #include <cstdio>
 #include <cmath>
+#include <random>
 
 // ===================== 辅助函数 =====================
 
@@ -574,727 +576,561 @@ void MyPlacer::QuadraticInitialPlacement()
 
 // ===================== 任务5：全局布局（ePlace 电静力学 + Nesterov） =====================
 
-static const float DCT_PI = 3.14159265358979323846f;
-
-// 2D 离散余弦变换求解器（自实现、零外部依赖）
-// 依据任务描述公式：对密度 ρ 做 DCT 得到系数 a_jk，再由 a_jk 加权求和得到电场 ξ_x、ξ_y。
-// 采用可分离 2D DCT，复杂度 O(m^3)，m<=256 时足够快。
-// 注意：此为自实现版本；后续如需更高精度/性能，可替换为 FFTW 等官方 FFT 库实现。
-struct DCTSolver
+// 正交 DCT-II，在物理坐标中求解 -Δphi=rho-mean(rho)。
+DCTSolver::DCTSolver(int dimension, double binWidth, double binHeight)
+    : m(dimension), hx(binWidth), hy(binHeight)
 {
-    int m;
-    vector<float> cosT, sinT;            // cosT[j*m+x]=cos(πj(x+0.5)/m)，sinT 同理
-    vector<float> cn;                    // 正交归一化系数：cn_j=√(1/m)(j=0) 或 √(2/m)(j≥1)
-    vector<float> tmpA, a, G, Sx, Sy;    // 复用缓冲区
-
-    // 基函数取正交的 DCT-II：φ_j(x)=cn_j·cos(πj(x+0.5)/m)，采样点在 bin 中心。
-    // 若采样点写成 x（网格顶点）则基在网格上不正交——Σ_{x=0}^{m-1} cos(πjx/m)
-    // 对奇数 j 等于 1 而非 0，于是直流分量（ρ̄=targetDensity=0.8）会泄漏进全部
-    // 奇次模态，导致"均匀密度解出非零电场"（实测 max|ξ|≈0.35），等价于给所有
-    // 单元叠加一个恒定的 +x/+y 推力，把布局整体往右上挤。
-    DCTSolver(int _m) : m(_m)
+    cosT.resize(m*m); sinT.resize(m*m); cn.resize(m);
+    tmp.resize(m*m); a.resize(m*m); spectral.resize(m*m); work.resize(m*m);
+    for (int j=0; j<m; ++j)
     {
-        cosT.resize(m * m);
-        sinT.resize(m * m);
-        cn.resize(m);
-        for (int j = 0; j < m; j++)
+        cn[j]=sqrt((j==0 ? 1.0 : 2.0)/m);
+        for (int x=0; x<m; ++x)
         {
-            cn[j] = (j == 0) ? sqrtf(1.0f / m) : sqrtf(2.0f / m);
-            for (int x = 0; x < m; x++)
-            {
-                float ang = DCT_PI * (float)j * (x + 0.5f) / m;
-                cosT[j * m + x] = cosf(ang);
-                sinT[j * m + x] = sinf(ang);
-            }
+            double angle=acos(-1.0)*j*(x+0.5)/m;
+            cosT[j*m+x]=cos(angle); sinT[j*m+x]=sin(angle);
         }
-        tmpA.resize(m * m);
-        a.resize(m * m);
-        G.resize(m * m);
-        Sx.resize(m * m);
-        Sy.resize(m * m);
     }
+}
 
-    // 输入 rho[m*m]（行优先 y*m+x），输出电场 ex、ey[m*m]
-    void solve(const vector<float> &rho, vector<float> &ex, vector<float> &ey)
+void DCTSolver::solve(const vector<double>& rho, vector<double>& ex,
+                      vector<double>& ey, vector<double>& phi, bool computeField)
+{
+    for (int x=0; x<m; ++x)
+        for (int k=0; k<m; ++k)
+        {
+            double s=0;
+            for (int y=0; y<m; ++y) s+=rho[y*m+x]*cosT[k*m+y];
+            tmp[k*m+x]=s*cn[k];
+        }
+    for (int j=0; j<m; ++j)
+        for (int k=0; k<m; ++k)
+        {
+            double s=0;
+            for (int x=0; x<m; ++x) s+=tmp[k*m+x]*cosT[j*m+x];
+            a[j*m+k]=s*cn[j];
+        }
+    auto inverse=[&](bool sineX, bool sineY, vector<double>& out)
     {
-        // 1) 列方向 DCT：tmpA[k][x] = cn_k Σ_y rho(x,y) cos(πk(y+0.5)/m)
-        for (int x = 0; x < m; x++)
-            for (int k = 0; k < m; k++)
+        out.assign(m*m,0);
+        for (int j=0; j<m; ++j)
+            for (int y=0; y<m; ++y)
             {
-                float s = 0;
-                const float *cosk = &cosT[k * m];
-                for (int y = 0; y < m; y++)
-                    s += rho[y * m + x] * cosk[y];
-                tmpA[k * m + x] = s * cn[k];
+                double s=0;
+                for (int k=0; k<m; ++k)
+                    s+=spectral[j*m+k]*cn[k]*(sineY?sinT[k*m+y]:cosT[k*m+y]);
+                work[j*m+y]=s;
             }
-        // 2) 行方向 DCT：a[j][k] = cn_j Σ_x tmpA[k][x] cos(πj(x+0.5)/m)
-        //    正交基下 a[j][k] 就是 ρ 在 φ_jφ_k 上的展开系数（cn_j·cn_k 即原先的 1/m²，
-        //    只是 j=0 或 k=0 时 norm² 为 m 而非 m/2，少了这个差别就会逐模态标错系数）
-        for (int k = 0; k < m; k++)
-            for (int j = 0; j < m; j++)
+        for (int y=0; y<m; ++y)
+            for (int x=0; x<m; ++x)
             {
-                float s = 0;
-                const float *cosj = &cosT[j * m];
-                for (int x = 0; x < m; x++)
-                    s += tmpA[k * m + x] * cosj[x];
-                a[j * m + k] = s * cn[j];
+                double s=0;
+                for (int j=0; j<m; ++j)
+                    s+=work[j*m+y]*cn[j]*(sineX?sinT[j*m+x]:cosT[j*m+x]);
+                out[y*m+x]=s;
             }
-        // 3) ξ_x：G[j][k]=a·w_j/(w_j²+w_k²)；Sx[j][y]=cn_k Σ_k G cos；ex=cn_j Σ_j Sx sin
-        for (int j = 0; j < m; j++)
-        {
-            float wj = DCT_PI * (float)j / m;
-            for (int k = 0; k < m; k++)
+    };
+    auto spectrum=[&](int derivative)
+    {
+        for (int j=0; j<m; ++j)
+            for (int k=0; k<m; ++k)
             {
-                float wk = DCT_PI * (float)k / m;
-                float denom = wj * wj + wk * wk;
-                G[j * m + k] = (denom < 1e-12f) ? 0.0f : (a[j * m + k] * wj / denom);
+                double wx=acos(-1.0)*j/(m*hx), wy=acos(-1.0)*k/(m*hy);
+                spectral[j*m+k]=(j==0&&k==0)?0:
+                    a[j*m+k]/(wx*wx+wy*wy)*(derivative==1?wx:derivative==2?wy:1);
             }
-        }
-        for (int j = 0; j < m; j++)
-            for (int y = 0; y < m; y++)
-            {
-                float s = 0;
-                for (int k = 0; k < m; k++)
-                    s += G[j * m + k] * cn[k] * cosT[k * m + y];
-                Sx[j * m + y] = s;
-            }
-        for (int y = 0; y < m; y++)
-            for (int x = 0; x < m; x++)
-            {
-                float s = 0;
-                for (int j = 0; j < m; j++)
-                    s += cn[j] * Sx[j * m + y] * sinT[j * m + x];
-                ex[y * m + x] = s;
-            }
-        // 4) ξ_y：G[j][k]=a·w_k/(w_j²+w_k²)；Sy[k][x]=cn_j Σ_j G cos；ey=cn_k Σ_k Sy sin
-        for (int j = 0; j < m; j++)
-        {
-            float wj = DCT_PI * (float)j / m;
-            for (int k = 0; k < m; k++)
-            {
-                float wk = DCT_PI * (float)k / m;
-                float denom = wj * wj + wk * wk;
-                G[j * m + k] = (denom < 1e-12f) ? 0.0f : (a[j * m + k] * wk / denom);
-            }
-        }
-        for (int k = 0; k < m; k++)
-            for (int x = 0; x < m; x++)
-            {
-                float s = 0;
-                for (int j = 0; j < m; j++)
-                    s += G[j * m + k] * cn[j] * cosT[j * m + x];
-                Sy[k * m + x] = s;
-            }
-        for (int y = 0; y < m; y++)
-            for (int x = 0; x < m; x++)
-            {
-                float s = 0;
-                for (int k = 0; k < m; k++)
-                    s += cn[k] * Sy[k * m + x] * sinT[k * m + y];
-                ey[y * m + x] = s;
-            }
+    };
+    spectrum(0); inverse(false,false,phi);
+    if (computeField)
+    {
+        spectrum(1); inverse(true,false,ex);
+        spectrum(2); inverse(false,true,ey);
     }
-};
+    else { ex.clear(); ey.clear(); }
+    energy=0;
+    for (int i=0; i<m*m; ++i) energy+=0.5*hx*hy*rho[i]*phi[i];
+}
 
-// ---- filler 初始化：填充空白到目标密度 ----
+MyPlacer::~MyPlacer()
+{
+    delete dctSolver;
+    for (auto& row:bins) for (Bin_2D* b:row) delete b;
+    for (Module* f:Fillers) delete f;
+}
+
+namespace
+{
+using Interval=pair<double,double>;
+vector<Interval> mergedIntervals(vector<Interval> intervals)
+{
+    sort(intervals.begin(),intervals.end());
+    vector<Interval> result;
+    for (const auto& v:intervals)
+        if (v.second>v.first)
+        {
+            if (!result.empty()&&v.first<=result.back().second)
+                result.back().second=max(result.back().second,v.second);
+            else result.push_back(v);
+        }
+    return result;
+}
+
+template<typename Visitor>
+void visitBins(MyPlacer& p,double x1,double y1,double x2,double y2,Visitor visit)
+{
+    CRect core=p.db->coreRegion;
+    int m=p.binDimension;
+    int i0=max(0,(int)floor((x1-core.ll.x)/p.binWidth-1e-9));
+    int i1=min(m-1,(int)floor((x2-core.ll.x)/p.binWidth));
+    int j0=max(0,(int)floor((y1-core.ll.y)/p.binHeight-1e-9));
+    int j1=min(m-1,(int)floor((y2-core.ll.y)/p.binHeight));
+    for (int i=i0; i<=i1; ++i)
+        for (int j=j0; j<=j1; ++j)
+        {
+            Bin_2D& b=*p.bins[i][j];
+            double ox=max(0.0,min((double)b.ur.x,x2)-max((double)b.ll.x,x1));
+            double oy=max(0.0,min((double)b.ur.y,y2)-max((double)b.ll.y,y1));
+            visit(b,ox,oy);
+        }
+}
+
+struct DensityBox { double x1,y1,x2,y2,scale,dx,dy; };
+DensityBox densityBox(const MyPlacer& p,const Module& m)
+{
+    CRect core=p.db->coreRegion;
+    double w=min((double)core.width(),max((double)m.width,(double)p.binWidth));
+    double h=min((double)core.height(),max((double)m.height,(double)p.binHeight));
+    double cx=(double)m.ll.x+m.width/2, cy=(double)m.ll.y+m.height/2;
+    double minX=core.ll.x+w/2,maxX=core.ur.x-w/2,minY=core.ll.y+h/2,maxY=core.ur.y-h/2;
+    double dx=cx>minX&&cx<maxX?1:0, dy=cy>minY&&cy<maxY?1:0;
+    // 小单元展开到至少一个 bin；边界处平移支持框，保持有效电荷总量。
+    cx=max(minX,min(maxX,cx)); cy=max(minY,min(maxY,cy));
+    double typeWeight=m.isMacro||m.isFiller?p.targetDensity:1;
+    return {cx-w/2,cy-h/2,cx+w/2,cy+h/2,(double)m.width*m.height/(w*h)*typeWeight,dx,dy};
+}
+
+double insideDerivative(double x,double lo,double hi)
+{
+    if (x>lo&&x<hi) return 1;
+    return x==lo||x==hi?0.5:0;
+}
+
+POS_2D projectedCenter(const Module& m,const CRect& core,double x,double y)
+{
+    return POS_2D(max(core.ll.x+0.5*m.width,min(core.ur.x-0.5*m.width,x)),
+                  max(core.ll.y+0.5*m.height,min(core.ur.y-0.5*m.height,y)));
+}
+void setCenter(Module& m,const POS_2D& c) { m.ll=POS_2D(c.x-m.width/2,c.y-m.height/2); }
+}
+
+// 水平扫描带分解布局行和终端并集；暗区与终端区互不重叠。
+void MyPlacer::preparePlacementRegions()
+{
+    placeableRegions.clear(); terminalRegions.clear(); darkRegions.clear(); placeableArea=0;
+    CRect core=db->coreRegion;
+    vector<CRect> rowRects,terminalRects;
+    vector<double> ys{core.ll.y,core.ur.y};
+    auto add=[&](double x1,double y1,double x2,double y2,vector<CRect>& out)
+    {
+        x1=max(x1,(double)core.ll.x); x2=min(x2,(double)core.ur.x);
+        y1=max(y1,(double)core.ll.y); y2=min(y2,(double)core.ur.y);
+        if (x2>x1&&y2>y1)
+        {
+            out.emplace_back(POS_2D(x1,y1),POS_2D(x2,y2)); ys.push_back(y1); ys.push_back(y2);
+        }
+    };
+    for (const SiteRow& r:db->SiteRows) add(r.start.x,r.bottom,r.end.x,r.bottom+r.height,rowRects);
+    for (Module* t:db->Terminals) add(t->ll.x,t->ll.y,t->ur().x,t->ur().y,terminalRects);
+    sort(ys.begin(),ys.end()); ys.erase(unique(ys.begin(),ys.end()),ys.end());
+    for (size_t band=1; band<ys.size(); ++band)
+    {
+        double bottom=ys[band-1],top=ys[band],mid=(bottom+top)/2;
+        vector<Interval> rowXs,termXs;
+        for (const auto& r:rowRects) if (r.ll.y<mid&&r.ur.y>mid) rowXs.emplace_back(r.ll.x,r.ur.x);
+        for (const auto& r:terminalRects) if (r.ll.y<mid&&r.ur.y>mid) termXs.emplace_back(r.ll.x,r.ur.x);
+        rowXs=mergedIntervals(rowXs); termXs=mergedIntervals(termXs);
+        auto append=[&](double l,double r,vector<CRect>& out)
+        { if (r>l) out.emplace_back(POS_2D(l,bottom),POS_2D(r,top)); };
+        double cursor=core.ll.x;
+        for (const auto& r:rowXs)
+        {
+            append(cursor,r.first,darkRegions); cursor=r.second;
+            double freeLeft=r.first;
+            for (const auto& t:termXs)
+            {
+                double l=max(r.first,t.first),right=min(r.second,t.second);
+                if (right<=l) continue;
+                append(freeLeft,l,placeableRegions); append(l,right,terminalRegions); freeLeft=right;
+            }
+            append(freeLeft,r.second,placeableRegions);
+        }
+        append(cursor,core.ur.x,darkRegions);
+    }
+    for (const CRect& r:placeableRegions) placeableArea+=(double)r.width()*r.height();
+}
+
 void MyPlacer::fillerInit()
 {
-    CRect core = db->coreRegion;
-    StdCellArea = MacroArea = 0;
-    for (Module *m : db->Nodes)
-    {
-        if (m->isMacro)
-            MacroArea += m->area;
-        else
-            StdCellArea += m->area;
-    }
-    // filler 总面积 = 目标密度 × 可放置面积 − 单元面积（填充空白到目标密度）
-    // 可放置面积 = core 面积 − 终端（固定 I/O pad）在 core 内的重叠面积
-    float termArea = 0;
-    for (Module *t : db->Terminals)
-    {
-        float ox = max(0.0f, min(core.ur.x, t->ur().x) - max(core.ll.x, t->ll.x));
-        float oy = max(0.0f, min(core.ur.y, t->ur().y) - max(core.ll.y, t->ll.y));
-        termArea += ox * oy;
-    }
-    float fillerArea = targetDensity * (core.area() - termArea) - StdCellArea - MacroArea;
-    if (fillerArea < 0)
-        fillerArea = 0;
-
-    // filler 尺寸 = 中间 80% 模块的平均面积
-    vector<float> areas;
-    areas.reserve(db->Nodes.size());
-    for (Module *m : db->Nodes)
-        areas.push_back(m->area);
-    sort(areas.begin(), areas.end());
-    int lo = (int)(areas.size() * 0.1f), hi = (int)(areas.size() * 0.9f);
-    float sum = 0;
-    int cnt = 0;
-    for (int i = lo; i < hi; i++)
-    {
-        sum += areas[i];
-        cnt++;
-    }
-    float avgFillerArea = cnt > 0 ? sum / cnt : 1.0f;
-    float fillerSize = sqrtf(avgFillerArea);
-
-    int nFiller = (int)(fillerArea / avgFillerArea);
-    if (nFiller > 500000)
-        nFiller = 500000; // 限制 filler 数量，避免内存过大
-
-    srand(54321);
-    for (int i = 0; i < nFiller; i++)
-    {
-        Module *f = new Module();
-        f->name = "filler_" + to_string(i);
-        f->width = fillerSize;
-        f->height = fillerSize;
-        f->area = f->width * f->height;
-        f->isFiller = true;
-        f->isFixed = false;
-        f->isMacro = false;
-        f->idx = (int)db->Nodes.size() + i;
-        float x = core.ll.x + (rand() / (float)RAND_MAX) * (core.width() - f->width);
-        float y = core.ll.y + (rand() / (float)RAND_MAX) * (core.height() - f->height);
-        f->ll = POS_2D(x, y);
-        Fillers.push_back(f);
-    }
-
     NodesAndFillers.clear();
-    NodesAndFillers.reserve(db->Nodes.size() + Fillers.size());
-    for (Module *m : db->Nodes)
-        NodesAndFillers.push_back(m);
-    for (Module *f : Fillers)
-        NodesAndFillers.push_back(f);
+    for (Module* f:Fillers) delete f;
+    Fillers.clear(); preparePlacementRegions();
+    StdCellArea=MacroArea=0;
+    vector<double> areas;
+    for (Module* m:db->Nodes)
+    {
+        (m->isMacro?MacroArea:StdCellArea)+=m->area; areas.push_back(m->area);
+    }
+    // 有效面积守恒：Std+td*Macro+td*Filler=td*可用面积。
+    double fillerArea=max(0.0,placeableArea-StdCellArea/targetDensity-MacroArea);
+    sort(areas.begin(),areas.end());
+    size_t lo=areas.size()/10,hi=areas.size()*9/10;
+    double sum=0;
+    for (size_t i=lo;i<hi;++i) sum+=areas[i];
+    double average=hi>lo?sum/(hi-lo):areas.empty()?1:areas[0];
+    // 数量上限只改变单个 filler 尺寸，不丢弃需补足的总面积。
+    double nominal=max(max(average,1e-9),fillerArea/500000.0),cumulative=0;
+    vector<double> cdf;
+    for (const auto& r:placeableRegions) { cumulative+=(double)r.width()*r.height(); cdf.push_back(cumulative); }
+    mt19937 random(54321);
+    uniform_real_distribution<double> uniform(0,1);
+    CRect core=db->coreRegion;
+    double remaining=fillerArea;
+    while (remaining>1e-9&&!placeableRegions.empty()&&!db->Nodes.empty())
+    {
+        double area=min(nominal,remaining);
+        Module* f=new Module();
+        double w=min((double)core.width(),sqrt(area)),h=area/w;
+        if (h>core.height()) { h=core.height(); w=area/h; }
+        f->width=w; f->height=h; f->area=f->width*f->height; f->isFiller=true;
+        f->idx=db->Nodes.size()+Fillers.size(); f->name="filler_"+to_string(Fillers.size());
+        size_t index=lower_bound(cdf.begin(),cdf.end(),uniform(random)*cumulative)-cdf.begin();
+        const CRect& r=placeableRegions[min(index,placeableRegions.size()-1)];
+        setCenter(*f,projectedCenter(*f,core,r.ll.x+uniform(random)*r.width(),r.ll.y+uniform(random)*r.height()));
+        Fillers.push_back(f); remaining-=area;
+    }
+    NodesAndFillers=db->Nodes;
+    NodesAndFillers.insert(NodesAndFillers.end(),Fillers.begin(),Fillers.end());
 }
 
-// ---- bin 网格初始化 ----
 void MyPlacer::binInit()
 {
-    int total = (int)NodesAndFillers.size();
-    binDimension = (int)round(sqrt((double)total));
-    binDimension = max(16, min(256, binDimension));
-    int m = binDimension;
-    CRect core = db->coreRegion;
-    binWidth = core.width() / m;
-    binHeight = core.height() / m;
-
-    for (auto &row : bins)
-        for (auto b : row)
-            delete b;
-    bins.assign(m, vector<Bin_2D *>(m, nullptr));
-    for (int i = 0; i < m; i++)
-        for (int j = 0; j < m; j++)
+    CRect core=db->coreRegion;
+    double meanArea=db->Nodes.empty()?core.area():((double)StdCellArea+MacroArea)/db->Nodes.size();
+    // 按平均面积和目标密度选择网格：每个 bin 约容纳四个平均单元。
+    int limit=max(4,globalOptions.maxBinDimension);
+    binDimension=max(4,min(limit,(int)ceil(sqrt(core.area()*targetDensity/max(1e-9,4*meanArea)))));
+    int m=binDimension;
+    binWidth=core.width()/m; binHeight=core.height()/m;
+    for (auto& row:bins) for (Bin_2D* b:row) delete b;
+    bins.assign(m,vector<Bin_2D*>(m,nullptr));
+    for (int i=0;i<m;++i)
+        for (int j=0;j<m;++j)
         {
-            Bin_2D *b = new Bin_2D();
-            b->ll = POS_2D(core.ll.x + i * binWidth, core.ll.y + j * binHeight);
-            b->ur = POS_2D(b->ll.x + binWidth, b->ll.y + binHeight);
-            b->center = POS_2D((b->ll.x + b->ur.x) * 0.5f, (b->ll.y + b->ur.y) * 0.5f);
-            b->width = binWidth;
-            b->height = binHeight;
-            b->area = binWidth * binHeight;
-            bins[i][j] = b;
+            Bin_2D* b=new Bin_2D();
+            b->ll=POS_2D(core.ll.x+i*binWidth,core.ll.y+j*binHeight);
+            b->ur=POS_2D(core.ll.x+(i+1)*binWidth,core.ll.y+(j+1)*binHeight);
+            b->center=POS_2D((b->ll.x+b->ur.x)/2,(b->ll.y+b->ur.y)/2);
+            b->width=b->ur.x-b->ll.x; b->height=b->ur.y-b->ll.y; b->area=b->width*b->height;
+            bins[i][j]=b;
         }
-
-    // terminalDensity：终端与 bin 的重叠面积 × targetDensity
-    for (Module *t : db->Terminals)
+    auto deposit=[&](const vector<CRect>& regions,bool dark)
     {
-        float tx1 = t->ll.x, ty1 = t->ll.y, tx2 = t->ur().x, ty2 = t->ur().y;
-        int i0 = max(0, (int)floor((tx1 - core.ll.x) / binWidth));
-        int i1 = min(m - 1, (int)floor((tx2 - core.ll.x) / binWidth));
-        int j0 = max(0, (int)floor((ty1 - core.ll.y) / binHeight));
-        int j1 = min(m - 1, (int)floor((ty2 - core.ll.y) / binHeight));
-        for (int i = i0; i <= i1; i++)
-            for (int j = j0; j <= j1; j++)
-            {
-                float ox = max(0.0f, min(bins[i][j]->ur.x, tx2) - max(bins[i][j]->ll.x, tx1));
-                float oy = max(0.0f, min(bins[i][j]->ur.y, ty2) - max(bins[i][j]->ll.y, ty1));
-                bins[i][j]->terminalDensity += targetDensity * ox * oy;
-            }
-    }
-    // darkDensity：core 内均可放置（暗区域在 core 外，不纳入网格），保持 0
-
-    if (dctSolver)
-    {
-        delete dctSolver;
-        dctSolver = nullptr;
-    }
-    dctSolver = new DCTSolver(m);
+        for (const CRect& r:regions)
+            visitBins(*this,r.ll.x,r.ll.y,r.ur.x,r.ur.y,[&](Bin_2D& b,double ox,double oy)
+            { (dark?b.DarkDensity:b.terminalDensity)+=targetDensity*ox*oy; });
+    };
+    deposit(darkRegions,true); deposit(terminalRegions,false);
+    delete dctSolver;
+    dctSolver=new DCTSolver(m,binWidth,binHeight);
 }
 
-// ---- 梯度向量初始化 ----
 void MyPlacer::gradientVectorInitialization()
 {
-    wirelengthGradient.assign(db->Nodes.size(), VECTOR_3D());
-    densityGradient.assign(NodesAndFillers.size(), VECTOR_3D());
-    totalGradient.assign(NodesAndFillers.size(), VECTOR_3D());
-    fillerGradient.assign(Fillers.size(), VECTOR_3D());
+    wirelengthGradient.assign(db->Nodes.size(),VECTOR_3D());
+    densityGradient.assign(NodesAndFillers.size(),VECTOR_3D());
+    totalGradient.assign(NodesAndFillers.size(),VECTOR_3D());
+    fillerGradient.assign(Fillers.size(),VECTOR_3D());
+    preconditioner.assign(NodesAndFillers.size(),1);
     nodeIndex.clear();
-    nodeIndex.reserve(db->Nodes.size());
-    for (int i = 0; i < (int)db->Nodes.size(); i++)
-        nodeIndex[db->Nodes[i]] = i;
-
-    // 预条件子用：每个可移动单元的线网连接度（入射线网数）
-    // 参考 RePlAce/DREAMPlace 的 sum_pin_weights_in_nodes，作为近似的 Hessian 对角项
-    pinWeights.assign(db->Nodes.size(), 0.0f);
-    for (Net *net : db->Nets)
-    {
-        if (net->netPins.size() < 2)
-            continue;
-        for (Pin *p : net->netPins)
-        {
-            if (p->module->isFixed)
-                continue;
-            auto it = nodeIndex.find(p->module);
-            if (it != nodeIndex.end())
-                pinWeights[it->second] += 1.0f;
-        }
-    }
+    for (size_t i=0;i<db->Nodes.size();++i) nodeIndex[db->Nodes[i]]=i;
+    pinWeights.assign(db->Nodes.size(),0);
+    for (Net* n:db->Nets)
+        if (n->netPins.size()>=2)
+            for (Pin* p:n->netPins)
+            {
+                auto it=nodeIndex.find(p->module);
+                if (it!=nodeIndex.end()) pinWeights[it->second]+=1;
+            }
 }
 
-// ---- 更新密度（单元 -> bin 重叠面积）----
 void MyPlacer::updateDensity()
 {
-    int m = binDimension;
-    CRect core = db->coreRegion;
-    for (int i = 0; i < m; i++)
-        for (int j = 0; j < m; j++)
-        {
-            bins[i][j]->nodeDensity = 0;
-            bins[i][j]->fillerDensity = 0;
-        }
-    for (Module *mod : NodesAndFillers)
+    for (auto& row:bins) for (Bin_2D* b:row) b->nodeDensity=b->fillerDensity=0;
+    for (Module* m:NodesAndFillers)
     {
-        float x1 = mod->ll.x, y1 = mod->ll.y, x2 = mod->ur().x, y2 = mod->ur().y;
-        int i0 = max(0, (int)floor((x1 - core.ll.x) / binWidth));
-        int i1 = min(m - 1, (int)floor((x2 - core.ll.x) / binWidth));
-        int j0 = max(0, (int)floor((y1 - core.ll.y) / binHeight));
-        int j1 = min(m - 1, (int)floor((y2 - core.ll.y) / binHeight));
-        for (int i = i0; i <= i1; i++)
-            for (int j = j0; j <= j1; j++)
-            {
-                Bin_2D *b = bins[i][j];
-                float ox = max(0.0f, min(b->ur.x, x2) - max(b->ll.x, x1));
-                float oy = max(0.0f, min(b->ur.y, y2) - max(b->ll.y, y1));
-                float overlap = ox * oy;
-                // 正电荷 = 单元真实面积（ePlace 密度模型：标准/宏/filler 均按面积计，
-                // 目标密度通过 filler 补足、再由 DCT 直流项隐式减去均值实现，
-                // 而不是对每个单元乘 targetDensity）。固定终端才乘 targetDensity（见 binInit）。
-                if (mod->isFiller)
-                    b->fillerDensity += overlap;
-                else
-                    b->nodeDensity += overlap;
-            }
+        DensityBox box=densityBox(*this,*m);
+        visitBins(*this,box.x1,box.y1,box.x2,box.y2,[&](Bin_2D& b,double ox,double oy)
+        { (m->isFiller?b.fillerDensity:b.nodeDensity)+=box.scale*ox*oy; });
     }
 }
 
-// ---- 更新密度梯度（DCT 解 Poisson 求电场）----
 void MyPlacer::updateDensityGradient()
 {
-    int m = binDimension;
-    CRect core = db->coreRegion;
-    vector<float> rho(m * m), ex(m * m), ey(m * m);
-    for (int i = 0; i < m; i++)
-        for (int j = 0; j < m; j++)
+    int m=binDimension;
+    vector<double> rho(m*m),ex,ey,phi;
+    for (int i=0;i<m;++i)
+        for (int j=0;j<m;++j)
         {
-            Bin_2D *b = bins[i][j];
-            float total = b->nodeDensity + b->fillerDensity + b->terminalDensity + b->DarkDensity;
-            rho[j * m + i] = total / b->area;
+            Bin_2D& b=*bins[i][j];
+            rho[j*m+i]=(b.nodeDensity+b.fillerDensity+b.terminalDensity+b.DarkDensity)/b.area;
         }
-    dctSolver->solve(rho, ex, ey);
-
-    int nodeCount = (int)db->Nodes.size();
-    // 密度梯度 = -Σ_bin (单元与 bin 的重叠面积) × ξ(bin)
-    // 这是本布局器密度模型（updateDensity 的 box overlap）的精确负梯度，
-    // 而非对单元中心单点采样。对跨度多个 bin 的宏单元，电场在单元内部变化显著，
-    // 单点采样（-q·ξ(center)）会严重低估/错估其受力方向，导致宏单元畸变。
-    // 参考 DREAMPlace electric_force.cpp 的面积积分做法。
-    for (int idx = 0; idx < (int)NodesAndFillers.size(); idx++)
+    dctSolver->solve(rho,ex,ey,phi,false);
+    densityEnergy=dctSolver->energy;
+    for (int i=0;i<m;++i) for (int j=0;j<m;++j) bins[i][j]->phi=phi[j*m+i];
+    // 对离散势能 D=1/2 Σrho*phi*binArea 求导：
+    // dD/dx=Σphi*d(有效重叠面积)/dx，与 -q*电场的连续模型对应。
+    // 共用同一展开框、面积补偿、类型权重及边界处理，支持数值差分验证。
+    for (size_t i=0;i<NodesAndFillers.size();++i)
     {
-        Module *mod = NodesAndFillers[idx];
-        float x1 = mod->ll.x, y1 = mod->ll.y, x2 = mod->ur().x, y2 = mod->ur().y;
-        int i0 = max(0, (int)floor((x1 - core.ll.x) / binWidth));
-        int i1 = min(m - 1, (int)floor((x2 - core.ll.x) / binWidth));
-        int j0 = max(0, (int)floor((y1 - core.ll.y) / binHeight));
-        int j1 = min(m - 1, (int)floor((y2 - core.ll.y) / binHeight));
-        float gx = 0, gy = 0;
-        for (int i = i0; i <= i1; i++)
-            for (int j = j0; j <= j1; j++)
-            {
-                float ox = max(0.0f, min(bins[i][j]->ur.x, x2) - max(bins[i][j]->ll.x, x1));
-                float oy = max(0.0f, min(bins[i][j]->ur.y, y2) - max(bins[i][j]->ll.y, y1));
-                float overlap = ox * oy;
-                gx += overlap * ex[j * m + i];
-                gy += overlap * ey[j * m + i];
-            }
-        densityGradient[idx].x = -gx;
-        densityGradient[idx].y = -gy;
-        densityGradient[idx].z = 0;
+        DensityBox box=densityBox(*this,*NodesAndFillers[i]);
+        double gx=0,gy=0;
+        visitBins(*this,box.x1,box.y1,box.x2,box.y2,[&](Bin_2D& b,double ox,double oy)
+        {
+            double dx=insideDerivative(box.x2,b.ll.x,b.ur.x)-insideDerivative(box.x1,b.ll.x,b.ur.x);
+            double dy=insideDerivative(box.y2,b.ll.y,b.ur.y)-insideDerivative(box.y1,b.ll.y,b.ur.y);
+            gx+=b.phi*box.scale*dx*oy*box.dx;
+            gy+=b.phi*box.scale*dy*ox*box.dy;
+        });
+        densityGradient[i].x=gx; densityGradient[i].y=gy; densityGradient[i].z=0;
     }
-    for (int f = 0; f < (int)Fillers.size(); f++)
-        fillerGradient[f] = densityGradient[nodeCount + f];
+    for (size_t i=0;i<Fillers.size();++i) fillerGradient[i]=densityGradient[db->Nodes.size()+i];
 }
 
-// ---- 更新线长梯度（WA 平滑线长模型）----
 void MyPlacer::updateWirelengthGradient()
 {
-    for (auto &g : wirelengthGradient)
-        g.SetZero();
-    float g = gamma;
-    vector<float> xs, ys, tp, tm;
-    for (Net *net : db->Nets)
+    for (auto& g:wirelengthGradient) g.SetZero();
+    wirelengthValue=0;
+    const double smooth=gamma;
+    vector<double> coordinates,positive,negative;
+    for (Net* net:db->Nets)
     {
-        int d = (int)net->netPins.size();
-        if (d < 2)
-            continue;
-        xs.resize(d);
-        ys.resize(d);
-        tp.resize(d);
-        tm.resize(d);
-        float xmax = -1e30f, xmin = 1e30f, ymax = -1e30f, ymin = 1e30f;
-        for (int i = 0; i < d; i++)
+        size_t count=net->netPins.size();
+        if (count<2) continue;
+        coordinates.resize(count); positive.resize(count); negative.resize(count);
+        for (int axis=0;axis<2;++axis)
         {
-            POS_2D a = pinAbsPos(net->netPins[i]);
-            xs[i] = a.x;
-            ys[i] = a.y;
-            xmax = max(xmax, a.x);
-            xmin = min(xmin, a.x);
-            ymax = max(ymax, a.y);
-            ymin = min(ymin, a.y);
-        }
-        // x 方向
-        float bp = 0, cp = 0, bm = 0, cm = 0;
-        for (int i = 0; i < d; i++)
-        {
-            tp[i] = expf((xs[i] - xmax) / g);
-            tm[i] = expf(-(xs[i] - xmin) / g);
-            bp += tp[i];
-            cp += xs[i] * tp[i];
-            bm += tm[i];
-            cm += xs[i] * tm[i];
-        }
-        for (int i = 0; i < d; i++)
-        {
-            Pin *p = net->netPins[i];
-            if (p->module->isFixed)
-                continue;
-            int idx = nodeIndex[p->module];
-            float gx = (bp + xs[i] * bp / g - cp / g) / (bp * bp) * tp[i] - (bm - xs[i] * bm / g + cm / g) / (bm * bm) * tm[i];
-            wirelengthGradient[idx].x += gx;
-        }
-        // y 方向
-        bp = cp = bm = cm = 0;
-        for (int i = 0; i < d; i++)
-        {
-            tp[i] = expf((ys[i] - ymax) / g);
-            tm[i] = expf(-(ys[i] - ymin) / g);
-            bp += tp[i];
-            cp += ys[i] * tp[i];
-            bm += tm[i];
-            cm += ys[i] * tm[i];
-        }
-        for (int i = 0; i < d; i++)
-        {
-            Pin *p = net->netPins[i];
-            if (p->module->isFixed)
-                continue;
-            int idx = nodeIndex[p->module];
-            float gy = (bp + ys[i] * bp / g - cp / g) / (bp * bp) * tp[i] - (bm - ys[i] * bm / g + cm / g) / (bm * bm) * tm[i];
-            wirelengthGradient[idx].y += gy;
+            double low=1e300,high=-1e300;
+            for (size_t i=0;i<count;++i)
+            {
+                POS_2D p=pinAbsPos(net->netPins[i]);
+                coordinates[i]=axis==0?p.x:p.y;
+                low=min(low,coordinates[i]); high=max(high,coordinates[i]);
+            }
+            double bp=0,bm=0,cp=0,cm=0;
+            for (size_t i=0;i<count;++i)
+            {
+                positive[i]=exp((coordinates[i]-high)/smooth);
+                negative[i]=exp((low-coordinates[i])/smooth);
+                bp+=positive[i]; bm+=negative[i];
+                cp+=coordinates[i]*positive[i]; cm+=coordinates[i]*negative[i];
+            }
+            double meanP=cp/bp,meanM=cm/bm;
+            wirelengthValue+=meanP-meanM;
+            for (size_t i=0;i<count;++i)
+            {
+                auto it=nodeIndex.find(net->netPins[i]->module);
+                if (it==nodeIndex.end()) continue;
+                double derivative=positive[i]/bp*(1+(coordinates[i]-meanP)/smooth)-
+                                  negative[i]/bm*(1-(coordinates[i]-meanM)/smooth);
+                if (axis==0) wirelengthGradient[it->second].x+=derivative;
+                else wirelengthGradient[it->second].y+=derivative;
+            }
         }
     }
 }
 
-// ---- 更新总梯度（含预条件子）----
-// 参考 RePlAce/DREAMPlace 的 PreconditionOp：
-//   precond_i = sum_pin_weights_in_nodes_i + alpha * density_weight * node_area_i
-//   grad_i   /= max(precond_i, 1.0)
-// 作用：λ 的全局平衡使密度项相对线长项很小，若不预条件，高连接度的宏单元
-// （线长梯度 ∝ 引脚数，密度梯度 ∝ 面积）的梯度量级是标准单元的数十上百倍，
-// 会让宏单元移动过快、拉扯整个布局发散。除以连接度+面积项后各单元步长趋于一致。
 void MyPlacer::updateTotalGradient()
 {
-    int nodeCount = (int)db->Nodes.size();
-    const float alpha = 1.0f; // 面积项权重（DREAMPlace 中自适应，这里取常量 1）
-    for (int i = 0; i < nodeCount; i++)
+    for (size_t i=0;i<NodesAndFillers.size();++i)
     {
-        totalGradient[i].x = wirelengthGradient[i].x + lambda * densityGradient[i].x;
-        totalGradient[i].y = wirelengthGradient[i].y + lambda * densityGradient[i].y;
-        totalGradient[i].z = 0;
-        float precond = pinWeights[i] + alpha * lambda * NodesAndFillers[i]->area;
-        if (precond < 1.0f)
-            precond = 1.0f;
-        totalGradient[i].x /= precond;
-        totalGradient[i].y /= precond;
-    }
-    for (int i = nodeCount; i < (int)NodesAndFillers.size(); i++)
-    {
-        totalGradient[i].x = lambda * densityGradient[i].x;
-        totalGradient[i].y = lambda * densityGradient[i].y;
-        totalGradient[i].z = 0;
-        float precond = alpha * lambda * NodesAndFillers[i]->area;
-        if (precond < 1.0f)
-            precond = 1.0f;
-        totalGradient[i].x /= precond;
-        totalGradient[i].y /= precond;
+        bool real=i<db->Nodes.size();
+        totalGradient[i].x=(real?wirelengthGradient[i].x:0)+lambda*densityGradient[i].x;
+        totalGradient[i].y=(real?wirelengthGradient[i].y:0)+lambda*densityGradient[i].y;
+        totalGradient[i].z=0;
+        double weight=NodesAndFillers[i]->isMacro||NodesAndFillers[i]->isFiller?targetDensity:1;
+        // 保留原始目标梯度；搜索方向单独除预条件，回溯可使用正确的方向导数。
+        preconditioner[i]=globalOptions.usePreconditioner?
+            max(1.0,(real?pinWeights[i]:0)+lambda*weight*NodesAndFillers[i]->area):1;
     }
 }
 
-// ---- 惩罚系数 λ 初始化（平衡线长梯度与密度梯度量级）----
-// 参考 RePlAce/DREAMPlace：λ0 = density_weight_base × (Σ|WLgrad| / Σ|densityGrad|)。
-// 关键：必须乘以一个很小的基础权重 8e-5（DREAMPlace params.json 默认值），
-// 让密度项在初始时远弱于线长项，从而保住二次布局已优化出的 HPWL；
-// 之后靠 RePlAce 的 μ∈[0.95,1.05] 反馈逐步把 λ 抬高到"恰好能铺开"的水平。
-// 若直接用裸比值（Σ|WLgrad|/Σ|densityGrad|），宏单元主导的密度梯度会让 λ 偏大
-// 约 4 个量级，密度项一开始就压过线长项，把二次布局的 HPWL 彻底搅乱（相差约 10 倍）。
 void MyPlacer::penaltyFactorInitilization()
 {
-    const float densityWeightBase = 8e-5f; // RePlAce/DREAMPlace 密度基础权重
-    double numerator = 0, denominator = 0;
-    for (auto &g : wirelengthGradient)
-        numerator += fabs((double)g.x) + fabs((double)g.y);
-    for (auto &g : densityGradient)
-        denominator += fabs((double)g.x) + fabs((double)g.y);
-    lambda = (denominator < 1e-12) ? 0.0f : (float)(densityWeightBase * numerator / denominator);
-    if (lambda < 1e-12f)
-        lambda = 1e-12f;
+    double numerator=0,denominator=0;
+    for (const auto& g:wirelengthGradient) numerator+=fabs(g.x)+fabs(g.y);
+    for (const auto& g:densityGradient) denominator+=fabs(g.x)+fabs(g.y);
+    // 正常情况按资料取梯度比；没有连线时退化为纯密度优化。
+    // 初始密度恰好均匀时不能固定为 λ=0，否则后续拥挤也无法恢复密度力。
+    lambda=denominator>1e-20?(numerator>1e-20?numerator/denominator:1):1;
 }
 
-// ---- 密度溢出率 τ ----
+void MyPlacer::updatePenaltyFactor(double deltaHPWL)
+{
+    if (lambda<=0) return;
+    // 资料公式：λk=λk-1*1.1^(1-ΔHPWL/350000)，log 域防溢出。
+    double logWeight=log(lambda)+log(1.1)*(1-deltaHPWL/3.5e5);
+    lambda=exp(max(-60.0,min(60.0,logWeight)));
+}
+
+void MyPlacer::updateSmoothingParameter(double overflow)
+{
+    double value=log(8.0*binWidth)+log(10.0)*((overflow-0.1)*20/9-1);
+    gamma=exp(max(log(1e-3),min(log(20.0*max(db->coreRegion.width(),db->coreRegion.height())),value)));
+}
+
 float MyPlacer::calcOverflow()
 {
-    int m = binDimension;
-    double totalOverflow = 0;
-    double normArea = StdCellArea + MacroArea;
-    if (normArea < 1e-12)
-        return 0;
-    for (int i = 0; i < m; i++)
-        for (int j = 0; j < m; j++)
-        {
-            Bin_2D *b = bins[i][j];
-            // 只计算可移动单元（标准+宏+filler）的溢出；终端/暗节点是固定的，
-            // 其占据面积从该 bin 的容量中扣除（不可放置）。
-            float movableArea = b->nodeDensity + b->fillerDensity;
-            float blockArea = (b->terminalDensity + b->DarkDensity) / targetDensity;
-            float capacity = targetDensity * (b->area - blockArea);
-            float over = movableArea - capacity;
-            if (over > 0)
-                totalOverflow += over;
-        }
-    return (float)(totalOverflow / normArea);
+    double normal=StdCellArea+targetDensity*MacroArea,excess=0;
+    if (normal<=1e-20) return 0;
+    for (const auto& row:bins)
+        for (const Bin_2D* b:row)
+            excess+=max(0.0,b->nodeDensity+b->terminalDensity+b->DarkDensity-targetDensity*b->area);
+    return excess/normal; // filler 不计入资料定义的溢出率
 }
 
-// ---- 全局布局主流程（ePlace）----
-void MyPlacer::GlobalPlacement()
+// NAG：先预测 z=x-βv，在 z 重新计算梯度，再从 z 完成梯度步。
+// λ、γ 和预条件在每次回溯中保持不变；BB 只比较同一目标下的梯度。
+bool MyPlacer::GlobalPlacement(const GlobalPlacementOptions& options)
 {
+    globalOptions=options; globalStats=GlobalPlacementStats();
+    CRect core=db->coreRegion;
+    if (!(targetDensity>0&&targetDensity<=1)||core.width()<=0||core.height()<=0||
+        options.maxIterations<0||options.maxBinDimension<4||db->SiteRows.empty()||
+        !(options.momentum>=0&&options.momentum<1)||!(options.stopOverflow>=0&&options.stopOverflow<=1))
+    {
+        globalStats.stopReason="输入参数或布局行无效";
+        cerr<<"  全局布局停止："<<globalStats.stopReason<<endl;
+        return false;
+    }
+    for (Module* m:db->Nodes)
+        if (!std::isfinite(m->ll.x)||!std::isfinite(m->ll.y)||m->width<=0||m->height<=0||
+            m->width>core.width()||m->height>core.height())
+        {
+            globalStats.stopReason="单元尺寸或坐标无效";
+            return false;
+        }
     fillerInit();
-    binInit();
-    gradientVectorInitialization();
-    stepSize = 1.0f * binWidth; // BB 步长初值（量级匹配预条件后的梯度）
-
-    int totalCount = (int)NodesAndFillers.size();
-    int maxIter = 1000;
-    vector<POS_2D> vel(totalCount);
-    for (auto &v : vel)
-        v.SetZero();
-    CRect core = db->coreRegion;
-    const float momentum = 0.8f;
-    const float stop_overflow = 0.1f; // DREAMPlace 停止判定的密度溢出阈值
-    const float maxMove = 8.0f * binWidth; // 每步最大位移，防止 overshoot 发散
-    bool lambdaFrozen = false;             // 密度解开后冻结 λ，避免其无界增长
-    double bestHpwl = 1e300;               // 追踪最优 HPWL，用于“已收敛/过度铺开”判定
-    int bestIter = 0;
-
-    // Barzilai-Borwein 自适应步长状态（参考 DREAMPlace Nesterov+BB 的 step_bb）：
-    // bb_short = <s,y>/<y,y>，s 为位置增量、y 为梯度增量。在“梯度僵硬”的细化阶段
-    // 会自动缩小步长、在铺开阶段自动放大，避免固定步长在细化期震荡/过度铺开。
-    vector<float> prevCx(totalCount), prevCy(totalCount); // 上一步中心
-    vector<float> prevGx(totalCount), prevGy(totalCount); // 上一步梯度
-
-    // 2. 第一次梯度计算 + λ 初始化
-    updateDensity();
-    float tau = calcOverflow();
-    gamma = 4.0f * (binWidth + binHeight) * powf(10.0f, (tau - 0.1f) * 20.0f / 9.0f - 1.0f);
-    if (gamma < 1e-3f)
-        gamma = 1e-3f;
-    if (gamma > 20.0f * max(core.width(), core.height()))
-        gamma = 20.0f * max(core.width(), core.height());
-    updateDensityGradient();
-    updateWirelengthGradient();
-    penaltyFactorInitilization();
-    updateTotalGradient();
-    float lambdaInit = lambda;
-    double hpwlPrev = calcHPWL(); // 用于 λ 自适应更新（步骤 2-3）
-    double hpwlInit = hpwlPrev;
-
-    // 初始化 BB 步长状态（首步：s=0 前的位置，g=当前梯度）
-    for (int i = 0; i < totalCount; i++)
+    if (placeableArea<=0)
     {
-        POS_2D c = NodesAndFillers[i]->center();
-        prevCx[i] = c.x;
-        prevCy[i] = c.y;
-        prevGx[i] = totalGradient[i].x;
-        prevGy[i] = totalGradient[i].y;
+        globalStats.stopReason="没有可放置面积";
+        cerr<<"  全局布局停止："<<globalStats.stopReason<<endl;
+        return false;
     }
-
-    printf("===== 全局布局 (ePlace) =====\n");
-    printf("  bin 网格: %d x %d   filler: %zu   targetDensity=%.2f   step=%.3f\n",
-           binDimension, binDimension, Fillers.size(), targetDensity, stepSize);
-    printf("  iter   HPWL          overflow   lambda      step\n");
-
-    // 3. 迭代（动量加速梯度下降 + Barzilai-Borwein 自适应步长）
-    for (int it = 0; it < maxIter; it++)
+    binInit(); gradientVectorInitialization(); updateDensity();
+    double tau=calcOverflow();
+    updateSmoothingParameter(tau); updateDensityGradient(); updateWirelengthGradient();
+    penaltyFactorInitilization(); updateTotalGradient();
+    double hpwl=calcHPWL();
+    globalStats.initialHPWL=hpwl; globalStats.initialOverflow=tau;
+    printf("===== 全局布局（Nesterov 前瞻梯度 + 静电模型）=====\n");
+    printf("  bin=%d x %d，filler=%zu，目标密度=%.2f，可放置面积=%.0f\n",
+           binDimension,binDimension,Fillers.size(),targetDensity,placeableArea);
+    printf("  预条件=%s，BB=%s，停滞停止=%s，初始 HPWL=%.0f，overflow=%.4f，lambda=%.4e\n",
+           options.usePreconditioner?"开":"关",options.useBBStep?"开":"关",
+           options.useStagnationStop?"开":"关",hpwl,tau,lambda);
+    printf("  iter  HPWL          overflow  lambda      gamma      step       maxMove  backtrack\n");
+    size_t count=NodesAndFillers.size();
+    vector<POS_2D> base(count),look(count),velocity(count),candidate(count);
+    vector<VECTOR_3D> lookGradient;
+    vector<double> lookPreconditioner;
+    stepSize=0;
+    double bestHPWL=1e300;
+    int bestIteration=0;
+    bool success=true;
+    if (tau<options.stopOverflow) globalStats.stopReason="初始密度溢出率已达到目标";
+    for (int iteration=0;iteration<options.maxIterations&&globalStats.stopReason.empty();++iteration)
     {
-        // 更新速度与位置（带位移限制，防止发散）
-        for (int i = 0; i < totalCount; i++)
+        for (size_t i=0;i<count;++i)
         {
-            Module *mod = NodesAndFillers[i];
-            float vx = momentum * vel[i].x + stepSize * totalGradient[i].x;
-            float vy = momentum * vel[i].y + stepSize * totalGradient[i].y;
-            float mag = sqrtf(vx * vx + vy * vy);
-            if (mag > maxMove)
+            Module& m=*NodesAndFillers[i];
+            base[i]=m.center();
+            look[i]=projectedCenter(m,core,base[i].x-options.momentum*velocity[i].x,
+                                   base[i].y-options.momentum*velocity[i].y);
+            setCenter(m,look[i]);
+        }
+        auto evaluate=[&]()
+        {
+            updateDensity(); updateDensityGradient(); updateWirelengthGradient(); updateTotalGradient();
+            return wirelengthValue+lambda*densityEnergy;
+        };
+        double lookEnergy=evaluate();
+        lookGradient=totalGradient; lookPreconditioner=preconditioner;
+        double largestDirection=0;
+        bool finite=std::isfinite(lookEnergy);
+        for (size_t i=0;i<count;++i)
+        {
+            finite=finite&&std::isfinite(lookGradient[i].x)&&std::isfinite(lookGradient[i].y);
+            largestDirection=max(largestDirection,hypot(lookGradient[i].x,lookGradient[i].y)/lookPreconditioner[i]);
+        }
+        if (!(stepSize>0)) stepSize=min(binWidth,binHeight)/max(1e-12,largestDirection);
+        double trialStep=stepSize;
+        bool accepted=false;
+        int backtracks=0;
+        for (;finite&&backtracks<40;++backtracks)
+        {
+            double dot=0,metric=0;
+            for (size_t i=0;i<count;++i)
             {
-                vx *= maxMove / mag;
-                vy *= maxMove / mag;
+                double dx=-trialStep*lookGradient[i].x/lookPreconditioner[i];
+                double dy=-trialStep*lookGradient[i].y/lookPreconditioner[i];
+                double length=hypot(dx,dy),maxMove=2.0*min(binWidth,binHeight);
+                if (length>maxMove) { dx*=maxMove/length; dy*=maxMove/length; }
+                candidate[i]=projectedCenter(*NodesAndFillers[i],core,look[i].x+dx,look[i].y+dy);
+                setCenter(*NodesAndFillers[i],candidate[i]);
+                double sx=candidate[i].x-look[i].x,sy=candidate[i].y-look[i].y;
+                dot+=lookGradient[i].x*sx+lookGradient[i].y*sy;
+                metric+=lookPreconditioner[i]*(sx*sx+sy*sy);
             }
-            vel[i].x = vx;
-            vel[i].y = vy;
-            POS_2D c = mod->center();
-            float cx = c.x - vx;
-            float cy = c.y - vy;
-            if (cx - mod->width * 0.5f < core.ll.x)
-                cx = core.ll.x + mod->width * 0.5f;
-            if (cx + mod->width * 0.5f > core.ur.x)
-                cx = core.ur.x - mod->width * 0.5f;
-            if (cy - mod->height * 0.5f < core.ll.y)
-                cy = core.ll.y + mod->height * 0.5f;
-            if (cy + mod->height * 0.5f > core.ur.y)
-                cy = core.ur.y - mod->height * 0.5f;
-            mod->ll = POS_2D(cx - mod->width * 0.5f, cy - mod->height * 0.5f);
+            double energy=evaluate();
+            if (std::isfinite(energy)&&energy<=lookEnergy+dot+metric/(2*trialStep)+1e-9*max(1.0,fabs(lookEnergy)))
+            { accepted=true; break; }
+            trialStep*=0.5;
         }
-
-        // 重新计算密度与溢出率
-        updateDensity();
-        tau = calcOverflow();
-        if (tau < stop_overflow)
-            lambdaFrozen = true;
-        gamma = 4.0f * (binWidth + binHeight) * powf(10.0f, (tau - 0.1f) * 20.0f / 9.0f - 1.0f);
-        if (gamma < 1e-3f)
-            gamma = 1e-3f;
-        if (gamma > 20.0f * max(core.width(), core.height()))
-            gamma = 20.0f * max(core.width(), core.height());
-
-        // 更新 λ（参考 RePlAce 的密度权重更新，ePlace 论文所用 μ 反馈机制）：
-        //   HPWL 改善 → 缓慢增大 λ（逐步加强密度惩罚）；
-        //   HPWL 恶化 → 按恶化幅度回落 λ（防止密度项过度挤压线长）。
-        // 关键：μ 只在 [0.95, 1.05] 附近小步变化，且允许 <1 回退，
-        //       而非上一版 [1.5, 3.0] 的强行单调增长（那会让 λ 十几轮就封顶、
-        //       密度项长期压过线长项，把二次布局已优化的 HPWL 破坏掉）。
-        double hpwl = calcHPWL();
-        double delta = hpwl - hpwlPrev;
-        double refHPWL = max(3.5e5, hpwlInit * 0.01);
-        // 只在铺开结束（τ 已明显下降）后追踪最优 HPWL；否则初始二次布局的
-        // 低 HPWL 会让 bestIter 卡在 0，铺开阶段一结束就误判为"长期无改善"。
-        if (tau < 0.5f && hpwl < bestHpwl)
+        if (!accepted)
         {
-            bestHpwl = hpwl;
-            bestIter = it;
+            for (size_t i=0;i<count;++i) setCenter(*NodesAndFillers[i],base[i]);
+            updateDensity();
+            globalStats.stopReason=finite?"回溯未找到有效步长，已恢复上一轮位置":"梯度或势能出现非有限数值，已恢复上一轮位置";
+            success=false; break;
         }
-        // 密度已基本解开后冻结 λ：否则 RePlAce 的 μ 反馈在 HPWL 微幅波动时
-        // 仍保持 μ≈1.03~1.05，λ 会以 3%/步复利无界增长，把已收敛的布局
-        // 继续往外挤、反而抬升 HPWL（过度铺开）。
-        if (!lambdaFrozen)
+        double maxShift=0,sdoty=0,ydoty=0;
+        for (size_t i=0;i<count;++i)
         {
-            // 密度已基本解开（τ<0.25）且线长开始恶化 → 冻结 λ（即 DREAMPlace
-            // Llambda 停止准则“overflow<stop && hpwl>prev”，此处把 0.1 放宽到 0.25）。
-            // 这个冻结是**承重**的：μ 在 HPWL 改善时恒 ≥1.029，不冻结则 λ 会复利
-            // 无界增长。实测把阈值放开到 0.11，λ 从 3.1e-2 一路涨到 2.54，τ 虽降到
-            // 0.106，但密度变成"边缘满、中心空"的环状（单元被推到芯片外墙上），
-            // 合法化位移从 1.6e7 涨到 1.5e8、HPWL 从 106.7M 劣化到 263.7M。
-            // 即 τ 的平台是 WL/密度权衡的平衡点，不是收敛缺陷，更不是可以硬压的指标。
-            if (tau < 0.25f && delta > 0)
-            {
-                lambdaFrozen = true;
-            }
-            else
-            {
-                const float UPPER_PCOF = 1.05f, LOWER_PCOF = 0.95f;
-                float mu;
-                if (delta < 0)
-                {
-                    // HPWL 改善：μ ≈ 1.05 × max(0.9999^it, 0.98)，迭代越靠后增幅越小
-                    mu = UPPER_PCOF * (float)max(pow(0.9999, (double)it), 0.98);
-                }
-                else
-                {
-                    // HPWL 恶化：μ = 1.05 × 1.05^(-ΔHPWL/ref)，夹到 [0.95, 1.05]
-                    mu = UPPER_PCOF * (float)pow((double)UPPER_PCOF, -delta / refHPWL);
-                    mu = max(LOWER_PCOF, min(UPPER_PCOF, mu));
-                }
-                lambda *= mu;
-                lambda = min(lambda, lambdaInit * 1e15f);
-            }
+            velocity[i]=POS_2D(base[i].x-candidate[i].x,base[i].y-candidate[i].y);
+            maxShift=max(maxShift,hypot((double)velocity[i].x,(double)velocity[i].y));
+            double sx=candidate[i].x-look[i].x,sy=candidate[i].y-look[i].y;
+            double gx=totalGradient[i].x-lookGradient[i].x,gy=totalGradient[i].y-lookGradient[i].y;
+            sdoty+=sx*gx+sy*gy; ydoty+=(gx*gx+gy*gy)/lookPreconditioner[i];
         }
-        hpwlPrev = hpwl;
-
-        // 用新 λ 重新计算梯度
-        updateDensityGradient();
-        updateWirelengthGradient();
-        updateTotalGradient();
-
-        // Barzilai-Borwein 自适应步长（s = 位置增量，y = 梯度增量）
-        {
-            double sdoty = 0, ydoty = 0, sdots = 0;
-            for (int i = 0; i < totalCount; i++)
-            {
-                POS_2D c = NodesAndFillers[i]->center();
-                float sx = c.x - prevCx[i], sy = c.y - prevCy[i];
-                float yx = totalGradient[i].x - prevGx[i];
-                float yy = totalGradient[i].y - prevGy[i];
-                sdoty += (double)sx * yx + (double)sy * yy;
-                ydoty += (double)yx * yx + (double)yy * yy;
-                sdots += (double)sx * sx + (double)sy * sy;
-            }
-            float newStep;
-            if (sdoty > 0 && ydoty > 0)
-                newStep = (float)(sdoty / ydoty); // bb_short：细化阶段自动变小
-            else
-                newStep = (float)min(sqrt(sdots / ydoty), (double)stepSize); // 回退
-            if (!(newStep > 0.0f)) // 含 NaN 保护
-                newStep = stepSize;
-            stepSize = max(0.1f * binWidth, min(8.0f * binWidth, newStep));
-            for (int i = 0; i < totalCount; i++)
-            {
-                POS_2D c = NodesAndFillers[i]->center();
-                prevCx[i] = c.x;
-                prevCy[i] = c.y;
-                prevGx[i] = totalGradient[i].x;
-                prevGy[i] = totalGradient[i].y;
-            }
-        }
-
-        if (it % 5 == 0 || it == maxIter - 1)
-        {
-            printf("  %4d   %-13.0f  %.4f   %.4e   %.3f\n",
-                   it, hpwl, tau, lambda, stepSize);
-        }
-
-        // 停止判定 1：密度溢出率低于目标阈值（DREAMPlace stop_overflow）
-        if (it > 10 && tau < stop_overflow)
-        {
-            printf("  密度溢出率 %.4f < %.2f，提前停止\n", tau, stop_overflow);
-            break;
-        }
-        // 停止判定 2：密度已基本解开后 HPWL 长期无改善 → 已收敛，避免过度铺开
-        if (it > 200 && tau < 0.25f && it - bestIter > 100)
-        {
-            printf("  HPWL 已 %d 轮无改善（best=%.0f @%d），停止过度铺开\n",
-                   it - bestIter, bestHpwl, bestIter);
-            break;
-        }
+        double previousHPWL=hpwl;
+        hpwl=calcHPWL(); tau=calcOverflow(); globalStats.iterations=iteration+1;
+        printf("  %4d  %-13.0f %.4f    %.3e   %.3e  %.3e  %7.3f  %d\n",
+               iteration+1,hpwl,tau,lambda,gamma,trialStep,maxShift,backtracks);
+        if (tau<options.stopOverflow) globalStats.stopReason="密度溢出率达到目标";
+        if (tau<0.5&&hpwl<bestHPWL) { bestHPWL=hpwl; bestIteration=iteration+1; }
+        if (options.useStagnationStop&&iteration>200&&tau<0.25&&iteration+1-bestIteration>100)
+            globalStats.stopReason="可选 HPWL 停滞条件触发";
+        if (!globalStats.stopReason.empty()) break;
+        // 梯度差已在同一 λ、γ 下取得，随后才更新下一轮的参数。
+        stepSize=options.useBBStep&&sdoty>0&&ydoty>0?
+            max(1e-12,min(trialStep*2,sdoty/ydoty)):trialStep*1.1;
+        updatePenaltyFactor(hpwl-previousHPWL); updateSmoothingParameter(tau);
     }
-
-    printf("  全局布局完成，HPWL = %.0f\n", calcHPWL());
+    if (globalStats.stopReason.empty()) globalStats.stopReason="达到最大迭代次数，未达到目标溢出率";
+    globalStats.finalHPWL=calcHPWL(); globalStats.finalOverflow=calcOverflow();
+    printf("  全局布局停止：%s；迭代=%d，HPWL=%.0f，overflow=%.4f\n",
+           globalStats.stopReason.c_str(),globalStats.iterations,globalStats.finalHPWL,globalStats.finalOverflow);
+    return success;
 }
 
 // ---- 任务7：候选行 + 行内二次优化标准单元合法化 ----

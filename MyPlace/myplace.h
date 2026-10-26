@@ -7,7 +7,26 @@
 
 class Bin_2D;
 class MyPlacer;
-struct DCTSolver; // 2D 离散余弦变换求解器（定义在 myplace.cpp，自实现零依赖）
+class DCTSolver;
+
+struct GlobalPlacementOptions
+{
+    int maxIterations = 1000;
+    float stopOverflow = 0.1f;
+    float momentum = 0.8f;
+    int maxBinDimension = 128; // 自实现 DCT 为 O(m^3)，限制运行成本
+    bool usePreconditioner = true; // 可关闭的数值加速扩展
+    bool useBBStep = false;        // 仅使用同一 λ、γ 下的梯度差
+    bool useStagnationStop = false;
+};
+
+struct GlobalPlacementStats
+{
+    int iterations = 0;
+    double initialHPWL = 0, finalHPWL = 0;
+    double initialOverflow = 0, finalOverflow = 0;
+    string stopReason;
+};
 
 // 密度网格单元（全局布局 ePlace 用）
 class Bin_2D
@@ -20,11 +39,11 @@ public:
     float height;
     float area;
 
-    float nodeDensity;    // 标准单元 + 宏单元密度贡献
-    float fillerDensity;  // 填充单元密度贡献
-    float terminalDensity; // 终端密度贡献
-    float DarkDensity;    // 不可放置区域（暗节点）密度贡献
-    float phi;            // 电势
+    double nodeDensity;    // 标准单元 + 加权宏单元的有效面积
+    double fillerDensity;  // 加权 filler 有效面积
+    double terminalDensity; // 位于布局行内的固定终端并集 × 目标密度
+    double DarkDensity;    // 行外暗区面积 × 目标密度
+    double phi;            // 电势
 
     Bin_2D()
     {
@@ -52,17 +71,20 @@ public:
         stepSize = 0.0f;
         StdCellArea = MacroArea = 0;
     }
+    ~MyPlacer();
+    MyPlacer(const MyPlacer &) = delete;
+    MyPlacer &operator=(const MyPlacer &) = delete;
 
     vector<vector<Bin_2D *>> bins;
 
-    float StdCellArea; // 标准单元总面积
-    float MacroArea;   // 宏单元总面积
+    double StdCellArea; // 标准单元总面积
+    double MacroArea;   // 宏单元总面积
 
     PlaceData *db;
 
     vector<VECTOR_3D> wirelengthGradient; // 线长梯度（节点数）
     vector<VECTOR_3D> densityGradient;    // 密度梯度（节点 + filler）
-    vector<VECTOR_3D> totalGradient;      // 总梯度（节点 + filler）
+    vector<VECTOR_3D> totalGradient;      // 原始总梯度；预条件单独用于搜索方向
     vector<VECTOR_3D> fillerGradient;     // filler 梯度
     vector<float> pinWeights;             // 每个可移动单元的线网连接度（预条件子用）
 
@@ -75,7 +97,7 @@ public:
     void QuadraticInitialPlacement();
 
     // 任务5：全局布局（ePlace 电静力学 + Nesterov）
-    void GlobalPlacement();
+    bool GlobalPlacement(const GlobalPlacementOptions &options = GlobalPlacementOptions());
 
     // 任务7：合法化（候选行 + 行内二次优化的标准单元合法化）
     void AbacusLegalization();
@@ -86,12 +108,19 @@ public:
     int binDimension;                 // bin 网格维度 m
     float binWidth, binHeight;        // 单个 bin 的宽高
     float targetDensity;              // 目标密度
-    float lambda;                     // 惩罚系数
+    double lambda;                    // 惩罚系数
     float gamma;                      // WA 线长模型平滑参数
     float stepSize;                   // Nesterov 步长
     unordered_map<Module *, int> nodeIndex; // 可移动单元 -> 索引
     DCTSolver *dctSolver;             // DCT 求解器（binInit 后创建）
+    GlobalPlacementOptions globalOptions;
+    GlobalPlacementStats globalStats;
+    vector<CRect> placeableRegions, terminalRegions, darkRegions;
+    double placeableArea = 0;
+    double densityEnergy = 0, wirelengthValue = 0;
+    vector<double> preconditioner;
 
+    void preparePlacementRegions();
     void fillerInit();
     void binInit();
     void gradientVectorInitialization();
@@ -101,6 +130,8 @@ public:
     void updateTotalGradient();
     void penaltyFactorInitilization();
     float calcOverflow();
+    void updateSmoothingParameter(double overflow);
+    void updatePenaltyFactor(double deltaHPWL);
 };
 
 #endif
