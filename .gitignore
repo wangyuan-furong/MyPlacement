@@ -1,4 +1,28 @@
+# CMake 构建目录及在源码目录构建时产生的文件
 build/
+/build-*/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
+/Makefile
+
+# 编译和链接产物
 *.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dll
 *.exe
+/myplace
+/task4_initial_placement_test
+
+# 程序生成的布局图片、GDS 文件和运行日志
+/output/
+*.log
+
+# 本地 benchmark 数据，运行时另行准备
 /adaptec1/

@@ -34,3 +34,13 @@ include_directories(
 )
 
 target_link_libraries(myplace "-lpthread -lm -ldl")
+
+option(MYPLACEMENT_BUILD_TESTS "Build task 4 algorithm checks" OFF)
+if(MYPLACEMENT_BUILD_TESTS)
+    enable_testing()
+    add_executable(task4_initial_placement_test
+        tests/task4_initial_placement_test.cpp
+        MyPlace/myplace.cpp
+    )
+    add_test(NAME task4_initial_placement COMMAND task4_initial_placement_test)
+endif()

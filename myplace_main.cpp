@@ -14,9 +14,9 @@ static double elapsedMs(steady_clock::time_point t0)    //计时器，毫秒级�
 
 int main(int argc, char *argv[])
 {
-    if (argc < 2)   //检测有无文件
+    if (argc < 2 || argc > 3 || (argc == 3 && string(argv[2]) != "--initial-only"))
     {
-        cerr << "用法: " << argv[0] << " <adaptec1.aux 路径>" << endl;
+        cerr << "用法: " << argv[0] << " <adaptec1.aux 路径> [--initial-only]" << endl;
         cerr << "示例: ./myplace ../综合设计III参考资料/综合设计III参考资料/任务2参考/BookShelf格式的解析/adaptec1/adaptec1.aux" << endl;
         return 1;
     }
@@ -60,6 +60,10 @@ int main(int argc, char *argv[])
     cout << "  随机布局      HPWL = " << fixed << setprecision(0) << hpwl1 << "   耗时 " << t1 << " ms" << endl;
     cout << "  聚类驱动布局  HPWL = " << hpwl2 << "   耗时 " << t2 << " ms" << endl;
     cout << "  二次解析布局  HPWL = " << hpwl3 << "   耗时 " << t3 << " ms" << endl;
+
+    // 可单独运行任务4，避免每次比较初始布局都执行后续全局布局和合法化。
+    if (argc == 3)
+        return 0;
 
     // ===== 任务5：全局布局（ePlace，从二次解析初值出发） =====
     cout << endl
