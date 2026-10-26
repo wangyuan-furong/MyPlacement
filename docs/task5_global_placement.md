@@ -18,14 +18,20 @@ MyPlace/myplace.cpp 中的 GlobalPlacement；参数和结果结构位于 MyPlace
 4. 根据平均单元面积和目标密度估计网格，每 bin 约四个平均单元。
    自实现 DCT 为 O(m^3)，每边默认上限 128，最小 4。
 5. 小于 bin 的单元以中心为参考展开密度支持框，面积补偿为
-   原宽/展开宽乘原高/展开高。密度统计、类型权重和梯度共用同一支持框。
-   靠边的支持框平移到 core 内保持电荷量；其平移饱和方向的导数按实际映射处理。
-   单元自身物理尺寸不变。
+   原宽/展开宽乘原高/展开高，宏单元和 filler 再乘目标密度。
+   靠边的支持框平移到 core 内保持电荷量，单元自身物理尺寸不变。
+   默认电场模式在真实单元中心取场，不使用支持框平移是否饱和来强制清零梯度。
 6. 用正交 DCT-II 解 Poisson 方程，采用 bin 中心采样及物理频率
    wx=πj/(m*binWidth)、wy=πk/(m*binHeight)，零频势置零。
    电势能为 D=1/2 Σ rho*phi*binArea。
-   电场可由同一谱系数重建，实际优化对上述离散势能及有效重叠面积直接求导，
-   使梯度与密度模型一致；并非对原始小单元只做一次中心电场采样。
+   默认按资料公式（10）重建电场：x 方向谱系数为 a*wx/(wx²+wy²)，
+   y 方向为 a*wy/(wx²+wy²)，分别做 sin-cos、cos-sin 逆变换。
+   电场定义在 bin 中心，用双线性插值得到真实单元中心的 xi_i；
+   根据公式（9）计算 densityGradient_i=(-q_i*xi_ix,-q_i*xi_iy)。
+   q_i 与第 7 页的密度权重一致：标准单元取面积，宏/filler 取目标密度乘面积。
+   core 边界的虚拟格点使用法向电场奇对称、切向电场偶对称的 Neumann 延拓，
+   因而墙面法向场为零，近墙合法中心不存在原先整段强制零梯度的区域。
+   原离散势能导数保留为 DiscreteEnergy 对照模式。
 7. 线长采用资料中的 WA 平滑模型，平滑参数
    gamma = 8*binWidth*10^((tau-0.1)*20/9-1)。
    HPWL 单独计算，用于输出及更新 lambda。
@@ -34,8 +40,13 @@ MyPlace/myplace.cpp 中的 GlobalPlacement；参数和结果结构位于 MyPlace
 9. 每轮保存实际位置 x 和上一轮位移 v，计算并投影前瞻位置 z=x-beta*v，
    在 z 重新统计密度并计算梯度，然后从 z 沿负梯度搜索新位置。
    实际更新后令 v=x-x_new。beta 默认 0.8。
-10. 每次回溯固定 lambda、gamma 和前瞻点的预条件因子，使用相同目标函数的
-    二次上界条件检查步长。单次梯度位移限制为两个 bin 的较短边长；
+10. 每次回溯固定 lambda、gamma 和前瞻点的预条件因子。
+    插值电场力不是 box 沉积离散势能的精确导数，因此默认电场模式采用局部梯度变化回溯：
+    alpha <= 0.95*sqrt(sum(p_i*|delta x_i|²)/sum(|delta g_i|²/p_i))。
+    delta g 是同一 lambda、gamma 下候选点与前瞻点的原始梯度差；
+    p_i 是冻结的前瞻点预条件因子。这是局部 Lipschitz 估计，不保证离散势能每轮下降。
+    DiscreteEnergy 对照模式继续使用原来的离散势能二次上界条件。
+    单次梯度位移限制为两个 bin 的较短边长；
     这不包含已有动量产生的位移，日志 maxMove 报告实际位置的完整变化。
     数值无效或回溯失败时恢复上轮位置并返回 false，主程序据此停止后续流程。
 11. 根据实际位置的 HPWL 变化更新
@@ -64,16 +75,20 @@ GlobalPlacementOptions 的默认配置：
 | usePreconditioner | true | 按连接数和有效面积缩放搜索方向 |
 | useBBStep | false | 使用同一 lambda、gamma 下的梯度差估计 BB 步长 |
 | useStagnationStop | false | 启用额外的 HPWL 停滞停止条件 |
+| densityGradientMethod | ElectricField | 默认按资料计算 -q*xi，DiscreteEnergy 为原势能导数对照 |
 
 预条件和回溯是数值实现扩展；不能将整段实现表述为逐字复现 PDF 的全部伪代码。
-原始总梯度保持 WLgradient+lambda*densityGradient，预条件单独用于搜索方向，
-因此回溯方向导数仍对应原目标。BB 开启时只比较本轮前瞻点与候选点在同一参数下
+原始总梯度保持 WLgradient+lambda*densityGradient，预条件单独用于搜索方向。
+默认电场模式不再将其当作 box 沉积势能的精确导数来断言能量上界。
+BB 开启时只比较本轮前瞻点与候选点在同一参数下
 的梯度，不再混用更新前后 lambda、gamma 的梯度差。
 
 代码调用示例：
 
     GlobalPlacementOptions options;
-    options.usePreconditioner = false; // 如需关闭扩展
+    // 默认 ElectricField：按资料的电场公式更新。
+    // 如需复现旧的离散势能导数模式：
+    // options.densityGradientMethod = DensityGradientMethod::DiscreteEnergy;
     bool ok = placer.GlobalPlacement(options);
 
 ## 构建和运行
@@ -93,7 +108,39 @@ GlobalPlacementOptions 的默认配置：
     cmake --build /tmp/myplacement-task5-build -j 2
     ctest --test-dir /tmp/myplacement-task5-build --output-on-failure
 
-## 2026-10-26 验证
+## 电场模式测试
+
+当前 CTest 检查电场解析模态及 -q*xi、单元中心与格间插值、标准/宏/filler
+电荷权重、近墙非零密度力、墙面法向与切向场、均匀密度零单元力。
+原离散势能有限差分测试显式使用 DiscreteEnergy，不将其误用于电场模式。
+两种梯度是不同的离散实现，不能宣称在有限网格上严格相等。
+
+## 当前电场模式验证（2026-10-26）
+
+Release 构建与任务 4、5 的 CTest 均通过。实际运行项目完整命令：
+
+    ./myplace /home/lnx/projects/综合设计3/MyPlacement/adaptec1/adaptec1.aux
+
+日志明确显示“密度梯度=电场 -q*xi，步长回溯=局部梯度变化”，
+没有启用 DiscreteEnergy 对照模式。
+
+| 指标 | 默认电场模式 |
+|---|---:|
+| 二次解析起点 HPWL | 42,982,845 |
+| 全局布局轮数 | 233 |
+| 最终密度溢出率 | 0.0966 |
+| 全局 HPWL | 82,000,698 |
+| 全局布局耗时 | 43.998 s |
+| 合法化后 HPWL | 84,269,479 |
+| 合法化 L1 位移 | 3,809,576 |
+| 同行重叠/行外/site未对齐/容量回退 | 均为 0 |
+
+停止原因是“密度溢出率达到目标”。完整流程正常退出，
+生成三种初始布局图片，以及全局布局、合法化的 BMP 和 GDS。
+全流程约 182.66 秒，包含约 127.52 秒的二次解析初始布局，不应与仅全局布局耗时混淆。
+下方旧表记录的是更换电场梯度之前的实验，不代表当前默认配置。
+
+## 历史验证：修改为电场模式之前
 
 Release 构建通过，任务 4 和任务 5 的 CTest 均通过。任务 5 检查覆盖：
 

@@ -715,6 +715,35 @@ double insideDerivative(double x,double lo,double hi)
     return x==lo||x==hi?0.5:0;
 }
 
+// 电场定义在 bin 中心，单元中心使用双线性插值。
+// core 边界的虚拟格点采用 Neumann 延拓：法向场为奇对称，切向场为偶对称，
+// 因而墙面法向场为零，靠墙的合法单元中心也不会出现整段强制零梯度。
+pair<double, double> fieldAtCenter(const MyPlacer &placer, const POS_2D &center)
+{
+    const CRect &core = placer.db->coreRegion;
+    int m = placer.binDimension;
+    double u = max(-0.5, min(m - 0.5, (center.x - core.ll.x) / (double)placer.binWidth - 0.5));
+    double v = max(-0.5, min(m - 0.5, (center.y - core.ll.y) / (double)placer.binHeight - 0.5));
+    int i0 = (int)floor(u), j0 = (int)floor(v);
+    double fx = u - i0, fy = v - j0;
+    double ex = 0, ey = 0;
+    for (int dx = 0; dx < 2; ++dx)
+        for (int dy = 0; dy < 2; ++dy)
+        {
+            int i = i0 + dx, j = j0 + dy;
+            double signX = 1, signY = 1;
+            if (i < 0) { i = -i - 1; signX = -1; }
+            if (i >= m) { i = 2 * m - i - 1; signX = -1; }
+            if (j < 0) { j = -j - 1; signY = -1; }
+            if (j >= m) { j = 2 * m - j - 1; signY = -1; }
+            double weight = (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy);
+            const Bin_2D &b = *placer.bins[i][j];
+            ex += weight * signX * b.electricFieldX;
+            ey += weight * signY * b.electricFieldY;
+        }
+    return {ex, ey};
+}
+
 POS_2D projectedCenter(const Module& m,const CRect& core,double x,double y)
 {
     return POS_2D(max(core.ll.x+0.5*m.width,min(core.ur.x-0.5*m.width,x)),
@@ -884,14 +913,34 @@ void MyPlacer::updateDensityGradient()
             Bin_2D& b=*bins[i][j];
             rho[j*m+i]=(b.nodeDensity+b.fillerDensity+b.terminalDensity+b.DarkDensity)/b.area;
         }
-    dctSolver->solve(rho,ex,ey,phi,false);
+    bool useField = globalOptions.densityGradientMethod == DensityGradientMethod::ElectricField;
+    dctSolver->solve(rho,ex,ey,phi,useField);
     densityEnergy=dctSolver->energy;
-    for (int i=0;i<m;++i) for (int j=0;j<m;++j) bins[i][j]->phi=phi[j*m+i];
-    // 对离散势能 D=1/2 Σrho*phi*binArea 求导：
-    // dD/dx=Σphi*d(有效重叠面积)/dx，与 -q*电场的连续模型对应。
-    // 共用同一展开框、面积补偿、类型权重及边界处理，支持数值差分验证。
+    for (int i=0;i<m;++i)
+        for (int j=0;j<m;++j)
+        {
+            Bin_2D &b = *bins[i][j];
+            b.phi = phi[j*m+i];
+            b.electricFieldX = useField ? ex[j*m+i] : 0;
+            b.electricFieldY = useField ? ey[j*m+i] : 0;
+        }
     for (size_t i=0;i<NodesAndFillers.size();++i)
     {
+        Module &mod = *NodesAndFillers[i];
+        if (useField)
+        {
+            // 资料公式（9）：grad D_i = -q_i * xi_i。
+            // q_i 与密度沉积采用相同有效面积：标准单元为面积，宏/filler 再乘目标密度。
+            pair<double, double> field = fieldAtCenter(*this, mod.center());
+            double charge = (double)mod.width * mod.height *
+                            (mod.isMacro || mod.isFiller ? targetDensity : 1.0);
+            densityGradient[i].x = -charge * field.first;
+            densityGradient[i].y = -charge * field.second;
+            densityGradient[i].z = 0;
+            continue;
+        }
+        // 对照模式：对离散势能 D=1/2 Σrho*phi*binArea 求导，
+        // dD/dx=Σphi*d(有效重叠面积)/dx；这条分支由数值差分单独验证。
         DensityBox box=densityBox(*this,*NodesAndFillers[i]);
         double gx=0,gy=0;
         visitBins(*this,box.x1,box.y1,box.x2,box.y2,[&](Bin_2D& b,double ox,double oy)
@@ -1038,6 +1087,9 @@ bool MyPlacer::GlobalPlacement(const GlobalPlacementOptions& options)
     printf("  预条件=%s，BB=%s，停滞停止=%s，初始 HPWL=%.0f，overflow=%.4f，lambda=%.4e\n",
            options.usePreconditioner?"开":"关",options.useBBStep?"开":"关",
            options.useStagnationStop?"开":"关",hpwl,tau,lambda);
+    printf("  密度梯度=%s，步长回溯=%s\n",
+           options.densityGradientMethod == DensityGradientMethod::ElectricField ? "电场 -q*xi" : "离散势能导数",
+           options.densityGradientMethod == DensityGradientMethod::ElectricField ? "局部梯度变化" : "离散势能上界");
     printf("  iter  HPWL          overflow  lambda      gamma      step       maxMove  backtrack\n");
     size_t count=NodesAndFillers.size();
     vector<POS_2D> base(count),look(count),velocity(count),candidate(count);
@@ -1092,7 +1144,22 @@ bool MyPlacer::GlobalPlacement(const GlobalPlacementOptions& options)
                 metric+=lookPreconditioner[i]*(sx*sx+sy*sy);
             }
             double energy=evaluate();
-            if (std::isfinite(energy)&&energy<=lookEnergy+dot+metric/(2*trialStep)+1e-9*max(1.0,fabs(lookEnergy)))
+            bool validCandidate = std::isfinite(energy);
+            double gradientChange = 0;
+            for (size_t i = 0; i < count; ++i)
+            {
+                validCandidate = validCandidate && std::isfinite(totalGradient[i].x) && std::isfinite(totalGradient[i].y);
+                double gx = totalGradient[i].x - lookGradient[i].x;
+                double gy = totalGradient[i].y - lookGradient[i].y;
+                gradientChange += (gx * gx + gy * gy) / lookPreconditioner[i];
+            }
+            // 插值电场力不是当前 box 沉积势能的精确导数，不能沿用其能量上界断言。
+            // 电场模式用同一 λ、γ 及预条件下的局部 Lipschitz 估计回溯：
+            // alpha <= 0.95 * ||delta x||_P / ||delta g||_(P^-1)。
+            bool stepOK = options.densityGradientMethod == DensityGradientMethod::ElectricField ?
+                (gradientChange <= 1e-30 || trialStep * trialStep * gradientChange <= 0.95 * 0.95 * metric) :
+                (energy <= lookEnergy + dot + metric / (2 * trialStep) + 1e-9 * max(1.0, fabs(lookEnergy)));
+            if (validCandidate && stepOK)
             { accepted=true; break; }
             trialStep*=0.5;
         }

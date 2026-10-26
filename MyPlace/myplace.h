@@ -9,6 +9,12 @@ class Bin_2D;
 class MyPlacer;
 class DCTSolver;
 
+enum class DensityGradientMethod
+{
+    ElectricField,  // 资料公式（9）、（10）：在单元中心插值电场，再计算 -q*xi
+    DiscreteEnergy // 保留原离散势能导数，供对照及差分测试
+};
+
 struct GlobalPlacementOptions
 {
     int maxIterations = 1000;
@@ -18,6 +24,7 @@ struct GlobalPlacementOptions
     bool usePreconditioner = true; // 可关闭的数值加速扩展
     bool useBBStep = false;        // 仅使用同一 λ、γ 下的梯度差
     bool useStagnationStop = false;
+    DensityGradientMethod densityGradientMethod = DensityGradientMethod::ElectricField;
 };
 
 struct GlobalPlacementStats
@@ -44,6 +51,7 @@ public:
     double terminalDensity; // 位于布局行内的固定终端并集 × 目标密度
     double DarkDensity;    // 行外暗区面积 × 目标密度
     double phi;            // 电势
+    double electricFieldX = 0, electricFieldY = 0; // bin 中心的电场 xi_x、xi_y
 
     Bin_2D()
     {
